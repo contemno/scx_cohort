@@ -66,6 +66,8 @@ pub struct Metrics {
     pub nr_merges: u64,
     #[stat(desc = "cohort splits from wake-edge discovery")]
     pub nr_splits: u64,
+    #[stat(desc = "tasks currently spilled off their home CCD (gauge)")]
+    pub nr_spilled: u64,
     #[stat(desc = "per-LLC statistics")]
     pub llcs: BTreeMap<usize, LlcMetrics>,
 }
@@ -74,13 +76,14 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={}",
+            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={} spilled={}",
             self.nr_cohorts,
             self.nr_tasks,
             self.affinity_hit_pct,
             self.nr_migrations,
             self.nr_merges,
             self.nr_splits,
+            self.nr_spilled,
         )?;
         writeln!(
             w,

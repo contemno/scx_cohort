@@ -143,6 +143,18 @@ struct {
 	__uint(max_entries, WAKE_EDGE_SLOTS);
 } wake_edges SEC(".maps");
 
+/*
+ * pid → spill target LLC. Written only by the daemon: members of an
+ * oversized cohort that it chose to run remotely. Sticky by construction —
+ * the same pids stay listed until demand fits the home LLC again.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, u32);
+	__uint(max_entries, 8192);
+} spill_tasks SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt = bpf_map_lookup_elem(&stats, &idx);
@@ -203,13 +215,20 @@ static u32 task_home_llc(struct task_struct *p)
 {
 	struct TaskCtx *tctx = lookup_task_ctx(p);
 	struct CohortCtx *cohort;
+	u32 pid = p->pid;
+	u32 *spill;
 	u64 id;
 
 	if (!tctx)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
 
-	if (tctx->is_spilled)
-		return safe_llc(tctx->spill_llc);
+	spill = bpf_map_lookup_elem(&spill_tasks, &pid);
+	if (spill) {
+		tctx->is_spilled = 1;
+		tctx->spill_llc = safe_llc(*spill);
+		return tctx->spill_llc;
+	}
+	tctx->is_spilled = 0;
 
 	id = resolve_cohort(p, tctx);
 	cohort = bpf_map_lookup_elem(&cohorts, &id);
@@ -399,6 +418,18 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 	if (vtime_before(vtime, vtime_now - slice_ns))
 		vtime = vtime_now - slice_ns;
 
+	/*
+	 * Tasks with the interactive signature — woken often, running
+	 * briefly (render threads, compositors, audio) — jump the queue
+	 * within their CCD by a bounded credit. The clamp above plus this
+	 * fixed bound keep the unfairness finite, so batch tasks cannot be
+	 * starved past the watchdog's patience.
+	 */
+	if (tctx && tctx->wake_freq >= tunables.credit_wake_freq_min &&
+	    tctx->avg_runtime_ns > 0 &&
+	    tctx->avg_runtime_ns <= tunables.credit_runtime_max_ns)
+		vtime -= tunables.credit_max_ns;
+
 	if (llcx && !scx_bpf_dsq_nr_queued(llc))
 		llcx->head_enq_ts = scx_bpf_now();
 
@@ -449,6 +480,26 @@ void BPF_STRUCT_OPS(cohort_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
+void BPF_STRUCT_OPS(cohort_runnable, struct task_struct *p, u64 enq_flags)
+{
+	struct TaskCtx *tctx = lookup_task_ctx(p);
+	u64 now, interval;
+
+	if (!tctx)
+		return;
+
+	now = scx_bpf_now();
+	if (tctx->last_wake_at) {
+		interval = now - tctx->last_wake_at;
+		if (interval > 0) {
+			u64 freq = 1000000000ULL / interval;
+
+			tctx->wake_freq = (tctx->wake_freq * 3 + freq) / 4;
+		}
+	}
+	tctx->last_wake_at = now;
+}
+
 void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 {
 	struct TaskCtx *tctx = lookup_task_ctx(p);
@@ -474,6 +525,7 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 
 	delta = scx_bpf_now() - tctx->last_run_at;
 	tctx->vtime += delta * 100 / p->scx.weight;
+	tctx->avg_runtime_ns = (tctx->avg_runtime_ns * 3 + delta) / 4;
 
 	cohort = bpf_map_lookup_elem(&cohorts, &tctx->cohort_id);
 	if (cohort)
@@ -588,6 +640,7 @@ void BPF_STRUCT_OPS(cohort_exit_task, struct task_struct *p,
 		u32 pid = p->pid;
 
 		bpf_map_delete_elem(&task_stats, &pid);
+		bpf_map_delete_elem(&spill_tasks, &pid);
 	}
 	/*
 	 * Empty cohorts and stale tgid_cohort entries are garbage-collected
@@ -662,6 +715,7 @@ SCX_OPS_DEFINE(cohort_ops,
 	       .select_cpu		= (void *)cohort_select_cpu,
 	       .enqueue			= (void *)cohort_enqueue,
 	       .dispatch		= (void *)cohort_dispatch,
+	       .runnable		= (void *)cohort_runnable,
 	       .running			= (void *)cohort_running,
 	       .stopping		= (void *)cohort_stopping,
 	       .init_task		= (void *)cohort_init_task,

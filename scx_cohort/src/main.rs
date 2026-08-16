@@ -12,6 +12,7 @@
 
 mod balancer;
 mod bpf_skel;
+mod config;
 mod domain;
 mod stats;
 mod wake_graph;
@@ -39,8 +40,8 @@ use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use zerocopy::{FromBytes, IntoBytes};
 
-use balancer::{Balancer, BalancerCfg};
-use domain::{CohortSnapshot, Decision, LlcLoad};
+use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
+use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
     CohortCtx, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, MAX_CPUS, MAX_LLCS, NR_STATS,
 };
@@ -90,6 +91,10 @@ struct Opts {
     /// wakes per second.
     #[clap(long, default_value = "300")]
     merge_wakes_per_sec: f64,
+
+    /// Path to a TOML rules file (see config.rs for the format).
+    #[clap(long)]
+    config: Option<std::path::PathBuf>,
 
     /// Enable stats monitoring with the specified interval in seconds.
     #[clap(long)]
@@ -159,6 +164,16 @@ struct Scheduler<'a> {
     /// Allocator for split-off cohort ids (offset from DAEMON_COHORT_BASE).
     daemon_seq: u64,
     sample_mult: u64,
+    config: config::Config,
+    spill_cfg: SpillCfg,
+    /// The spill set as last written to the BPF map: pid → target LLC.
+    current_spills: HashMap<u32, u32>,
+    /// pid → runtime_sum at the previous tick, for duty deltas.
+    prev_runtime: HashMap<u32, u64>,
+    /// tgid → cgroup path, lazily read from procfs for rule matching.
+    cgroup_cache: HashMap<u32, String>,
+    /// cohort → residency override from matched rules.
+    residency_overrides: HashMap<u64, u64>,
     nr_migrations: u64,
     nr_merges: u64,
     nr_splits: u64,
@@ -250,6 +265,22 @@ impl<'a> Scheduler<'a> {
             prev_edges: HashMap::new(),
             daemon_seq: 0,
             sample_mult: 1 << opts.tunables().sample_shift,
+            config: match &opts.config {
+                Some(path) => {
+                    let cfg = config::Config::load(path)?;
+                    info!("loaded {} rule(s) from {:?}", cfg.rules.len(), path);
+                    cfg
+                }
+                None => config::Config::default(),
+            },
+            spill_cfg: SpillCfg {
+                tick_ns: opts.interval_ms * 1_000_000,
+                ..SpillCfg::default()
+            },
+            current_spills: HashMap::new(),
+            prev_runtime: HashMap::new(),
+            cgroup_cache: HashMap::new(),
+            residency_overrides: HashMap::new(),
             nr_migrations: 0,
             nr_merges: 0,
             nr_splits: 0,
@@ -292,6 +323,7 @@ impl<'a> Scheduler<'a> {
                 pinned: ctx.flags & COHORT_PINNED != 0,
                 nr_tasks: ctx.nr_tasks,
                 load_ns: ctx.load_sum.saturating_sub(prev),
+                residency_ms: self.residency_overrides.get(&id).copied(),
             });
         }
 
@@ -371,10 +403,13 @@ impl<'a> Scheduler<'a> {
         Ok(out)
     }
 
-    /// tgid → live task count, from the pid-keyed task_stats map.
-    fn snapshot_tgid_tasks(&self) -> Result<HashMap<u32, u64>> {
+    /// Snapshot the pid-keyed task_stats map, computing per-tick duty
+    /// deltas from the monotonic runtime sums.
+    fn snapshot_tasks(&mut self) -> Result<Vec<TaskSnapshot>> {
         let map = &self.skel.maps.task_stats;
-        let mut out: HashMap<u32, u64> = HashMap::new();
+        let mut out = Vec::new();
+        let mut seen = HashMap::new();
+
         for key in map.keys() {
             let Some(val) = map.lookup(&key, MapFlags::ANY)? else {
                 continue;
@@ -382,9 +417,110 @@ impl<'a> Scheduler<'a> {
             let Ok(ts) = TaskStat::read_from_bytes(val.as_slice()) else {
                 continue;
             };
-            *out.entry(ts.tgid).or_default() += 1;
+            let pid = u32::from_ne_bytes(key.as_slice().try_into()?);
+            let prev = self.prev_runtime.get(&pid).copied().unwrap_or(ts.runtime_sum);
+            seen.insert(pid, ts.runtime_sum);
+
+            let comm_len = ts.comm.iter().position(|&b| b == 0).unwrap_or(ts.comm.len());
+            out.push(TaskSnapshot {
+                pid,
+                tgid: ts.tgid,
+                cohort_id: ts.cohort_id,
+                duty_ns: ts.runtime_sum.saturating_sub(prev),
+                comm: String::from_utf8_lossy(&ts.comm[..comm_len]).into_owned(),
+            });
         }
+        self.prev_runtime = seen;
         Ok(out)
+    }
+
+    fn cgroup_of(&mut self, tgid: u32) -> String {
+        if let Some(path) = self.cgroup_cache.get(&tgid) {
+            return path.clone();
+        }
+        // "0::/user.slice/..." — strip the header and the leading slash so
+        // globs like "user.slice/*" match naturally.
+        let path = std::fs::read_to_string(format!("/proc/{tgid}/cgroup"))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.splitn(3, ':').nth(2).map(|p| p.trim_start_matches('/').to_string()))
+            })
+            .unwrap_or_default();
+        self.cgroup_cache.insert(tgid, path.clone());
+        path
+    }
+
+    /// Apply TOML rules: pin matched cohorts and collect per-cohort
+    /// residency overrides for the balancer.
+    fn apply_rules(&mut self, tasks: &[TaskSnapshot]) -> Result<()> {
+        if self.config.rules.is_empty() {
+            return Ok(());
+        }
+
+        let live_tgids: std::collections::HashSet<u32> = tasks.iter().map(|t| t.tgid).collect();
+        self.cgroup_cache.retain(|tgid, _| live_tgids.contains(tgid));
+
+        let mut overrides = HashMap::new();
+        let mut pins: HashMap<u64, u32> = HashMap::new();
+        // Borrow-check friendly two-step: resolve cgroups first.
+        let matches: Vec<(u64, Option<u32>, Option<u64>)> = tasks
+            .iter()
+            .map(|t| (t.clone(), self.cgroup_of(t.tgid)))
+            .collect::<Vec<_>>()
+            .iter()
+            .filter_map(|(t, cgroup)| {
+                self.config
+                    .match_task(&t.comm, cgroup)
+                    .map(|r| (t.cohort_id, r.pin_ccd, r.min_ccd_residency_ms))
+            })
+            .collect();
+        for (cohort, pin, residency) in matches {
+            if let Some(ms) = residency {
+                let e = overrides.entry(cohort).or_insert(ms);
+                *e = (*e).max(ms);
+            }
+            if let Some(ccd) = pin {
+                pins.insert(cohort, ccd);
+            }
+        }
+        self.residency_overrides = overrides;
+
+        let cohorts_map = &self.skel.maps.cohorts;
+        for (cohort, ccd) in pins {
+            let key = cohort.to_ne_bytes();
+            let Some(val) = cohorts_map.lookup(&key, MapFlags::ANY)? else {
+                continue;
+            };
+            let Ok(mut ctx) = CohortCtx::read_from_bytes(val.as_slice()) else {
+                continue;
+            };
+            let want_home = ccd.min(self.llc_cpus.len() as u32 - 1);
+            if ctx.flags & COHORT_PINNED == 0 || ctx.home_llc != want_home {
+                debug!("pinning cohort {} to LLC {}", cohort, want_home);
+                ctx.flags |= COHORT_PINNED;
+                ctx.home_llc = want_home;
+                cohorts_map.update(&key, ctx.as_bytes(), MapFlags::EXIST)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sync the desired spill set into the BPF map.
+    fn apply_spills(&mut self, desired: HashMap<u32, u32>) -> Result<()> {
+        let map = &self.skel.maps.spill_tasks;
+        for (pid, llc) in &desired {
+            if self.current_spills.get(pid) != Some(llc) {
+                map.update(&pid.to_ne_bytes(), &llc.to_ne_bytes(), MapFlags::ANY)?;
+            }
+        }
+        for pid in self.current_spills.keys() {
+            if !desired.contains_key(pid) {
+                let _ = map.delete(&pid.to_ne_bytes());
+            }
+        }
+        self.current_spills = desired;
+        Ok(())
     }
 
     fn apply_merge(&mut self, plan: wake_graph::MergePlan) -> Result<()> {
@@ -493,7 +629,11 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn discover_relationships(&mut self, cohorts: &[CohortSnapshot]) -> Result<()> {
+    fn discover_relationships(
+        &mut self,
+        cohorts: &[CohortSnapshot],
+        tasks: &[TaskSnapshot],
+    ) -> Result<()> {
         let dt_s = self.interval.as_secs_f64();
         let deltas = self.snapshot_edges()?;
         self.wake_graph.observe(&deltas, dt_s, self.sample_mult);
@@ -506,7 +646,10 @@ impl<'a> Scheduler<'a> {
             self.apply_merge(plan)?;
         }
 
-        let tgid_tasks = self.snapshot_tgid_tasks()?;
+        let mut tgid_tasks: HashMap<u32, u64> = HashMap::new();
+        for t in tasks {
+            *tgid_tasks.entry(t.tgid).or_default() += 1;
+        }
         let mut cohort_tgids: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
         for (&tgid, &cohort) in &tgid_cohort {
             if cohort_sizes.contains_key(&cohort) {
@@ -607,6 +750,7 @@ impl<'a> Scheduler<'a> {
             nr_migrations: self.nr_migrations,
             nr_merges: self.nr_merges,
             nr_splits: self.nr_splits,
+            nr_spilled: self.current_spills.len() as u64,
             llcs: llcs
                 .iter()
                 .map(|l| {
@@ -624,11 +768,21 @@ impl<'a> Scheduler<'a> {
     }
 
     fn tick(&mut self) -> Result<(Vec<CohortSnapshot>, Vec<LlcLoad>)> {
+        let tasks = self.snapshot_tasks()?;
+        self.apply_rules(&tasks)?;
         let cohorts = self.snapshot_cohorts()?;
         let llcs = self.llc_loads(&cohorts);
         let decisions = self.balancer.plan(self.now_ms(), &llcs, &cohorts);
         self.apply(decisions)?;
-        self.discover_relationships(&cohorts)?;
+        let desired = plan_spills(
+            &self.spill_cfg,
+            &llcs,
+            &cohorts,
+            &tasks,
+            &self.current_spills,
+        );
+        self.apply_spills(desired)?;
+        self.discover_relationships(&cohorts, &tasks)?;
         Ok((cohorts, llcs))
     }
 

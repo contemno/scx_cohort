@@ -29,6 +29,20 @@ pub struct CohortSnapshot {
     /// Weight-scaled runtime this tick (delta of the monotonic
     /// `CohortCtx::load_sum`).
     pub load_ns: u64,
+    /// Per-cohort residency override from a matched rule, if any.
+    pub residency_ms: Option<u64>,
+}
+
+/// One task as seen at a balancer tick (from the task_stats map).
+#[derive(Debug, Clone)]
+pub struct TaskSnapshot {
+    pub pid: u32,
+    pub tgid: u32,
+    pub cohort_id: u64,
+    /// On-CPU nanoseconds this tick (delta of the monotonic runtime sum).
+    pub duty_ns: u64,
+    /// Kernel comm, for rule matching.
+    pub comm: String,
 }
 
 /// A planner conclusion for `main.rs` to apply to the BPF maps.
