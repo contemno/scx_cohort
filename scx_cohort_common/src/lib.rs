@@ -75,6 +75,11 @@ pub struct TaskCtx {
     pub is_spilled: u32,
     /// Target LLC while spilled (valid only when `is_spilled != 0`).
     pub spill_llc: u32,
+    /// Cached placement LLC from the last wakeup resolution; `stopping`
+    /// compares it against the LLC that actually ran the task to account
+    /// home-vs-away runtime.
+    pub home_llc: u32,
+    pub _pad: u32,
 }
 
 /// Per-cohort placement policy. Created once by the BPF side when a
@@ -125,6 +130,9 @@ pub struct TaskStat {
     pub cohort_id: u64,
     /// Monotonic on-CPU nanoseconds; the daemon diffs per tick for duty.
     pub runtime_sum: u64,
+    /// The subset of `runtime_sum` executed on the task's home LLC; the
+    /// per-tick ratio of the two deltas is the task's affinity.
+    pub runtime_home_sum: u64,
     /// Kernel comm, NUL-padded.
     pub comm: [u8; 16],
 }
@@ -173,13 +181,13 @@ mod tests {
     /// assertions pin them so refactors can't change them unnoticed.
     #[test]
     fn layouts_are_stable() {
-        assert_eq!(size_of::<TaskCtx>(), 56);
+        assert_eq!(size_of::<TaskCtx>(), 64);
         assert_eq!(align_of::<TaskCtx>(), 8);
         assert_eq!(size_of::<CohortPolicy>(), 8);
         assert_eq!(size_of::<CohortCounters>(), 16);
         assert_eq!(align_of::<CohortCounters>(), 8);
         assert_eq!(size_of::<WakeEdgeKey>(), 8);
-        assert_eq!(size_of::<TaskStat>(), 40);
+        assert_eq!(size_of::<TaskStat>(), 48);
         assert_eq!(align_of::<TaskStat>(), 8);
         assert_eq!(size_of::<Tunables>(), 48);
     }

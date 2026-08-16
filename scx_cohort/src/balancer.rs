@@ -259,6 +259,7 @@ mod tests {
             tgid: pid,
             cohort_id,
             duty_ns,
+            home_ns: 0,
             comm: String::new(),
         }
     }

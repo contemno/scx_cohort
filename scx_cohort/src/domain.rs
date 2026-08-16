@@ -41,6 +41,8 @@ pub struct TaskSnapshot {
     pub cohort_id: u64,
     /// On-CPU nanoseconds this tick (delta of the monotonic runtime sum).
     pub duty_ns: u64,
+    /// The subset of `duty_ns` executed on the task's home LLC.
+    pub home_ns: u64,
     /// Kernel comm, for rule matching.
     pub comm: String,
 }

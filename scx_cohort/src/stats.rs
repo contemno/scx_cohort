@@ -154,26 +154,194 @@ pub fn affinity_pct(direct: u64, enq_home: u64, enq_spill: u64, steals: u64) -> 
     }
 }
 
-pub fn server_data() -> StatsServerData<(), Metrics> {
-    let open: Box<dyn StatsOpener<(), Metrics>> = Box::new(move |(req_ch, res_ch)| {
-        req_ch.send(())?;
-        let mut prev = res_ch.recv()?;
+/// One process (thread group) in the procs view.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(_om_prefix = "pr_", _om_label = "process")]
+pub struct ProcRow {
+    #[stat(desc = "thread group id")]
+    pub tgid: u64,
+    #[stat(desc = "process comm")]
+    pub comm: String,
+    #[stat(desc = "live threads")]
+    pub threads: u64,
+    #[stat(desc = "threads currently spilled to the other CCD")]
+    pub spilled: u64,
+    #[stat(desc = "CPU utilization, % of one CPU")]
+    pub util_pct: f64,
+    #[stat(desc = "% of runtime executed on the home CCD")]
+    pub affinity_pct: f64,
+}
 
-        let read: Box<dyn StatsReader<(), Metrics>> = Box::new(move |_args, (req_ch, res_ch)| {
-            req_ch.send(())?;
-            let cur = res_ch.recv()?;
-            let delta = cur.delta(&prev);
-            prev = cur;
-            delta.to_json()
-        });
+/// One cohort with its member processes.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(_om_prefix = "c_", _om_label = "cohort")]
+pub struct CohortRow {
+    #[stat(desc = "home CCD (LLC id)")]
+    pub home_llc: u64,
+    #[stat(desc = "pinned by a rule (1/0)")]
+    pub pinned: u64,
+    #[stat(desc = "live tasks")]
+    pub tasks: u64,
+    #[stat(desc = "CPU utilization, % of one CPU")]
+    pub util_pct: f64,
+    #[stat(desc = "% of member runtime executed on the home CCD")]
+    pub affinity_pct: f64,
+    #[stat(desc = "member processes, keyed by tgid")]
+    pub procs: BTreeMap<usize, ProcRow>,
+}
+
+/// The `scx_cohort top` payload: everything per-cohort and per-process.
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(top)]
+pub struct ProcsSnapshot {
+    #[stat(desc = "live tasks under the scheduler")]
+    pub nr_tasks: u64,
+    #[stat(desc = "global % of runtime executed on home CCDs")]
+    pub affinity_pct: f64,
+    #[stat(desc = "per-LLC utilization, % of LLC capacity")]
+    pub llc_util_pct: BTreeMap<usize, f64>,
+    #[stat(desc = "cohorts, keyed by cohort id")]
+    pub cohorts: BTreeMap<usize, CohortRow>,
+}
+
+/// Pure assembly of the procs view from one tick's snapshots; unit-tested
+/// without a kernel.
+pub fn procs_snapshot(
+    cohorts: &[crate::domain::CohortSnapshot],
+    tasks: &[crate::domain::TaskSnapshot],
+    llcs: &[crate::domain::LlcLoad],
+    spills: &std::collections::HashMap<u32, u32>,
+    tick: Duration,
+) -> ProcsSnapshot {
+    let tick_ns = tick.as_nanos().max(1) as u64;
+    let pct = |num: u64, den: u64| {
+        if den > 0 {
+            num as f64 * 100.0 / den as f64
+        } else {
+            100.0
+        }
+    };
+
+    let mut out = ProcsSnapshot {
+        nr_tasks: tasks.len() as u64,
+        ..Default::default()
+    };
+
+    for llc in llcs {
+        out.llc_util_pct.insert(
+            llc.llc as usize,
+            llc.load_ns as f64 * 100.0 / llc.capacity_ns.max(1) as f64,
+        );
+    }
+
+    let (total_duty, total_home) = tasks
+        .iter()
+        .fold((0u64, 0u64), |(d, h), t| (d + t.duty_ns, h + t.home_ns));
+    out.affinity_pct = pct(total_home, total_duty);
+
+    for c in cohorts {
+        let mut row = CohortRow {
+            home_llc: c.home_llc as u64,
+            pinned: c.pinned as u64,
+            ..Default::default()
+        };
+        let mut cohort_duty = 0u64;
+        let mut cohort_home = 0u64;
+
+        for t in tasks.iter().filter(|t| t.cohort_id == c.id) {
+            cohort_duty += t.duty_ns;
+            cohort_home += t.home_ns;
+            row.tasks += 1;
+            let proc_row = row.procs.entry(t.tgid as usize).or_insert_with(|| ProcRow {
+                tgid: t.tgid as u64,
+                comm: t.comm.clone(),
+                ..Default::default()
+            });
+            proc_row.threads += 1;
+            proc_row.spilled += spills.contains_key(&t.pid) as u64;
+            proc_row.util_pct += t.duty_ns as f64 * 100.0 / tick_ns as f64;
+            // Accumulate ns; converted to a percentage below.
+            proc_row.affinity_pct += t.home_ns as f64;
+        }
+        for proc_row in row.procs.values_mut() {
+            let duty_ns = proc_row.util_pct / 100.0 * tick_ns as f64;
+            proc_row.affinity_pct = if duty_ns > 0.0 {
+                (proc_row.affinity_pct / duty_ns * 100.0).min(100.0)
+            } else {
+                100.0
+            };
+        }
+        row.util_pct = cohort_duty as f64 * 100.0 / tick_ns as f64;
+        row.affinity_pct = pct(cohort_home, cohort_duty);
+        out.cohorts.insert(c.id as usize, row);
+    }
+    out
+}
+
+/// Requests the scheduler loop answers over the stats channels.
+#[derive(Debug)]
+pub enum StatsReq {
+    Metrics,
+    Procs,
+}
+
+#[derive(Debug)]
+pub enum StatsRes {
+    Metrics(Metrics),
+    Procs(ProcsSnapshot),
+}
+
+pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
+    let open: Box<dyn StatsOpener<StatsReq, StatsRes>> = Box::new(move |(req_ch, res_ch)| {
+        req_ch.send(StatsReq::Metrics)?;
+        let StatsRes::Metrics(mut prev) = res_ch.recv()? else {
+            anyhow::bail!("unexpected stats response");
+        };
+
+        let read: Box<dyn StatsReader<StatsReq, StatsRes>> =
+            Box::new(move |_args, (req_ch, res_ch)| {
+                req_ch.send(StatsReq::Metrics)?;
+                let StatsRes::Metrics(cur) = res_ch.recv()? else {
+                    anyhow::bail!("unexpected stats response");
+                };
+                let delta = cur.delta(&prev);
+                prev = cur;
+                delta.to_json()
+            });
 
         Ok(read)
     });
 
+    let procs_open: Box<dyn StatsOpener<StatsReq, StatsRes>> =
+        Box::new(move |(_req_ch, _res_ch)| {
+            let read: Box<dyn StatsReader<StatsReq, StatsRes>> =
+                Box::new(move |_args, (req_ch, res_ch)| {
+                    req_ch.send(StatsReq::Procs)?;
+                    let StatsRes::Procs(snapshot) = res_ch.recv()? else {
+                        anyhow::bail!("unexpected stats response");
+                    };
+                    snapshot.to_json()
+                });
+            Ok(read)
+        });
+
     StatsServerData::new()
         .add_meta(LlcMetrics::meta())
         .add_meta(Metrics::meta())
+        .add_meta(ProcRow::meta())
+        .add_meta(CohortRow::meta())
+        .add_meta(ProcsSnapshot::meta())
         .add_ops("top", StatsOps { open, close: None })
+        .add_ops(
+            "procs",
+            StatsOps {
+                open: procs_open,
+                close: None,
+            },
+        )
 }
 
 pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
@@ -183,4 +351,68 @@ pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
         || shutdown.load(Ordering::Relaxed),
         |metrics| metrics.format(&mut std::io::stdout()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{CohortSnapshot, LlcLoad, TaskSnapshot};
+    use std::collections::HashMap;
+
+    #[test]
+    fn procs_snapshot_aggregates_threads_and_affinity() {
+        let tick = Duration::from_millis(200);
+        let tick_ns = 200_000_000u64;
+        let cohorts = [CohortSnapshot {
+            id: 7,
+            home_llc: 1,
+            pinned: true,
+            nr_tasks: 3,
+            load_ns: tick_ns,
+            residency_ms: None,
+        }];
+        // Two threads of tgid 100 (one fully home, one half home) and one
+        // of tgid 200, fully away.
+        let t = |pid, tgid, duty, home, comm: &str| TaskSnapshot {
+            pid,
+            tgid,
+            cohort_id: 7,
+            duty_ns: duty,
+            home_ns: home,
+            comm: comm.into(),
+        };
+        let tasks = [
+            t(101, 100, tick_ns / 2, tick_ns / 2, "game"),
+            t(102, 100, tick_ns / 2, tick_ns / 4, "game"),
+            t(201, 200, tick_ns / 4, 0, "helper"),
+        ];
+        let llcs = [
+            LlcLoad { llc: 0, load_ns: 0, capacity_ns: tick_ns * 8 },
+            LlcLoad { llc: 1, load_ns: tick_ns, capacity_ns: tick_ns * 8 },
+        ];
+        let spills: HashMap<u32, u32> = [(201, 0)].into();
+
+        let s = procs_snapshot(&cohorts, &tasks, &llcs, &spills, tick);
+        assert_eq!(s.nr_tasks, 3);
+        let c = &s.cohorts[&7];
+        assert_eq!(c.home_llc, 1);
+        assert_eq!(c.pinned, 1);
+        assert_eq!(c.tasks, 3);
+        // Cohort: 1.25 CPUs of demand → 125%.
+        assert!((c.util_pct - 125.0).abs() < 0.1);
+        // Cohort affinity: (0.5 + 0.25 + 0) / 1.25 = 60%.
+        assert!((c.affinity_pct - 60.0).abs() < 0.1);
+
+        let game = &c.procs[&100];
+        assert_eq!(game.threads, 2);
+        assert_eq!(game.spilled, 0);
+        assert!((game.util_pct - 100.0).abs() < 0.1);
+        assert!((game.affinity_pct - 75.0).abs() < 0.1);
+
+        let helper = &c.procs[&200];
+        assert_eq!(helper.spilled, 1);
+        assert!((helper.affinity_pct - 0.0).abs() < 0.1);
+        // LLC 1 runs 1 tick of work on 8 CPUs → 12.5%.
+        assert!((s.llc_util_pct[&1] - 12.5).abs() < 0.1);
+    }
 }
