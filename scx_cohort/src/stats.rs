@@ -111,21 +111,46 @@ impl Metrics {
     }
 
     fn delta(&self, rhs: &Self) -> Self {
-        Self {
-            nr_sync_local: self.nr_sync_local - rhs.nr_sync_local,
-            nr_prev_idle: self.nr_prev_idle - rhs.nr_prev_idle,
-            nr_idle_core: self.nr_idle_core - rhs.nr_idle_core,
-            nr_idle_smt: self.nr_idle_smt - rhs.nr_idle_smt,
-            nr_home_miss_clamp: self.nr_home_miss_clamp - rhs.nr_home_miss_clamp,
-            nr_enq_home: self.nr_enq_home - rhs.nr_enq_home,
-            nr_enq_spill: self.nr_enq_spill - rhs.nr_enq_spill,
-            nr_steals: self.nr_steals - rhs.nr_steals,
-            nr_tctx_errors: self.nr_tctx_errors - rhs.nr_tctx_errors,
-            nr_migrations: self.nr_migrations - rhs.nr_migrations,
-            nr_merges: self.nr_merges - rhs.nr_merges,
-            nr_splits: self.nr_splits - rhs.nr_splits,
+        // saturating_sub: a transient counter-read failure upstream can
+        // make a "cumulative" value regress; clamping beats wrapping.
+        let mut d = Self {
+            nr_sync_local: self.nr_sync_local.saturating_sub(rhs.nr_sync_local),
+            nr_prev_idle: self.nr_prev_idle.saturating_sub(rhs.nr_prev_idle),
+            nr_idle_core: self.nr_idle_core.saturating_sub(rhs.nr_idle_core),
+            nr_idle_smt: self.nr_idle_smt.saturating_sub(rhs.nr_idle_smt),
+            nr_home_miss_clamp: self.nr_home_miss_clamp.saturating_sub(rhs.nr_home_miss_clamp),
+            nr_enq_home: self.nr_enq_home.saturating_sub(rhs.nr_enq_home),
+            nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
+            nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),
+            nr_tctx_errors: self.nr_tctx_errors.saturating_sub(rhs.nr_tctx_errors),
+            nr_migrations: self.nr_migrations.saturating_sub(rhs.nr_migrations),
+            nr_merges: self.nr_merges.saturating_sub(rhs.nr_merges),
+            nr_splits: self.nr_splits.saturating_sub(rhs.nr_splits),
             ..self.clone()
-        }
+        };
+        // Affinity over THIS interval, not since attach — a cumulative
+        // percentage would bury fresh regressions under old history.
+        d.affinity_hit_pct = affinity_pct(
+            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt,
+            d.nr_enq_home,
+            d.nr_enq_spill,
+            d.nr_steals,
+        );
+        d
+    }
+}
+
+/// The affinity hit rate: placements that ended up on the home CCD over
+/// all placements. A stolen task was counted at enqueue as landing home
+/// but actually ran away, so steals move from the numerator to the
+/// denominator's "away" side rather than being double-counted.
+pub fn affinity_pct(direct: u64, enq_home: u64, enq_spill: u64, steals: u64) -> f64 {
+    let home = (direct + enq_home).saturating_sub(steals);
+    let total = direct + enq_home + enq_spill;
+    if total > 0 {
+        home as f64 * 100.0 / total as f64
+    } else {
+        100.0
     }
 }
 

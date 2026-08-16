@@ -77,19 +77,31 @@ pub struct TaskCtx {
     pub spill_llc: u32,
 }
 
-/// Per-cohort state. Created by the BPF side on first sight of a cohort;
-/// `home_llc` is owned by the daemon's load balancer thereafter.
+/// Per-cohort placement policy. Created once by the BPF side when a
+/// cohort first appears; thereafter written only by the daemon (moves,
+/// pins) and read by the fast path. Kept separate from [`CohortCounters`]
+/// so each side has exclusive write ownership of whole map values —
+/// userspace map updates replace entire values and would otherwise race
+/// the BPF side's atomic counter arithmetic.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
-pub struct CohortCtx {
+pub struct CohortPolicy {
     /// The LLC this cohort's tasks are placed on by default.
     pub home_llc: u32,
     /// `COHORT_PINNED` etc.
     pub flags: u32,
-    /// Live member count; the daemon garbage-collects at 0.
+}
+
+/// Per-cohort counters, written only by the BPF side (atomically); the
+/// daemon reads them and never writes existing entries back.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct CohortCounters {
+    /// Approximate live member count (informational; the daemon derives
+    /// exact membership from task_stats).
     pub nr_tasks: u64,
     /// Monotonic weight-scaled runtime sum; the daemon diffs per tick to
-    /// compute cohort load.
+    /// compute the cohort's demand.
     pub load_sum: u64,
 }
 
@@ -163,8 +175,9 @@ mod tests {
     fn layouts_are_stable() {
         assert_eq!(size_of::<TaskCtx>(), 56);
         assert_eq!(align_of::<TaskCtx>(), 8);
-        assert_eq!(size_of::<CohortCtx>(), 24);
-        assert_eq!(align_of::<CohortCtx>(), 8);
+        assert_eq!(size_of::<CohortPolicy>(), 8);
+        assert_eq!(size_of::<CohortCounters>(), 16);
+        assert_eq!(align_of::<CohortCounters>(), 8);
         assert_eq!(size_of::<WakeEdgeKey>(), 8);
         assert_eq!(size_of::<TaskStat>(), 40);
         assert_eq!(align_of::<TaskStat>(), 8);

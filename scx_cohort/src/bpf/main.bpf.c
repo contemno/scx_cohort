@@ -92,17 +92,46 @@ struct {
 	__type(value, struct TaskCtx);
 } task_ctxs SEC(".maps");
 
+/*
+ * Cohort state is split into two maps so each side owns whole values
+ * exclusively: userspace map updates replace entire values, which would
+ * race BPF-side atomic arithmetic if they shared a struct.
+ *
+ * cohort_policy: created here (BPF_NOEXIST) when a cohort first appears;
+ * every later write (moves, pins) comes from the daemon.
+ */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, u64);
-	__type(value, struct CohortCtx);
+	__type(value, struct CohortPolicy);
 	__uint(max_entries, MAX_COHORTS);
-} cohorts SEC(".maps");
+} cohort_policy SEC(".maps");
+
+/* cohort_counters: written only here (atomically); the daemon reads. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u64);
+	__type(value, struct CohortCounters);
+	__uint(max_entries, MAX_COHORTS);
+} cohort_counters SEC(".maps");
+
+/*
+ * Weight-scaled runtime actually executed per LLC (as opposed to cohort
+ * demand, which is charged to the cohort wherever its tasks ran). The
+ * daemon diffs this for the balancer's imbalance signal, so spilled and
+ * stolen work counts where it runs.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, MAX_LLCS);
+} llc_load SEC(".maps");
 
 /*
  * tgid → cohort id. Entries persist until the daemon garbage-collects
- * cohorts whose nr_tasks dropped to zero (Phase 3); sized generously so
- * the interim leak is harmless.
+ * tgids with no live tasks; sized generously so the interim leak is
+ * harmless.
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -211,10 +240,9 @@ static u64 resolve_cohort(struct task_struct *p, struct TaskCtx *tctx)
  * The LLC this task should be placed on: its cohort's home, or the spill
  * target if the daemon marked it spilled.
  */
-static u32 task_home_llc(struct task_struct *p)
+static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 {
-	struct TaskCtx *tctx = lookup_task_ctx(p);
-	struct CohortCtx *cohort;
+	struct CohortPolicy *policy;
 	u32 pid = p->pid;
 	u32 *spill;
 	u64 id;
@@ -231,11 +259,11 @@ static u32 task_home_llc(struct task_struct *p)
 	tctx->is_spilled = 0;
 
 	id = resolve_cohort(p, tctx);
-	cohort = bpf_map_lookup_elem(&cohorts, &id);
-	if (!cohort)
+	policy = bpf_map_lookup_elem(&cohort_policy, &id);
+	if (!policy)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
 
-	return safe_llc(cohort->home_llc);
+	return safe_llc(policy->home_llc);
 }
 
 /*
@@ -280,9 +308,9 @@ static void record_wake_edge(struct task_struct *p)
  * per-LLC DSQ is consumed only by that LLC's CPUs, so enqueueing such a
  * task at home would strand it.
  */
-static u32 task_effective_llc(struct task_struct *p)
+static u32 task_effective_llc(struct task_struct *p, struct TaskCtx *tctx)
 {
-	u32 home = task_home_llc(p);
+	u32 home = task_home_llc(p, tctx);
 	struct llc_ctx *llcx = lookup_llc_ctx(home);
 	const struct cpumask *mask;
 
@@ -298,6 +326,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
 	const struct cpumask *idle_smt, *home_mask;
+	struct TaskCtx *tctx;
 	struct scratch_ctx *sctx;
 	struct bpf_cpumask *scratch;
 	struct llc_ctx *llcx;
@@ -311,7 +340,8 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (p->nr_cpus_allowed == 1)
 		return prev_cpu;
 
-	home = task_home_llc(p);
+	tctx = lookup_task_ctx(p);
+	home = task_home_llc(p, tctx);
 	llcx = lookup_llc_ctx(home);
 	if (!llcx)
 		return prev_cpu;
@@ -328,7 +358,6 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
 		struct task_struct *waker = (void *)bpf_get_current_task_btf();
-		struct TaskCtx *tctx = lookup_task_ctx(p);
 		struct TaskCtx *wtctx = waker ? bpf_task_storage_get(&task_ctxs, waker, 0, 0) : NULL;
 
 		if (tctx && wtctx && tctx->cohort_id == wtctx->cohort_id) {
@@ -406,7 +435,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct TaskCtx *tctx = lookup_task_ctx(p);
-	u32 llc = task_effective_llc(p);
+	u32 llc = task_effective_llc(p, tctx);
 	struct llc_ctx *llcx = lookup_llc_ctx(llc);
 	u64 vtime_now = llcx ? llcx->vtime_now : 0;
 	u64 vtime = tctx ? tctx->vtime : vtime_now;
@@ -516,21 +545,29 @@ void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 {
+	struct CohortCounters *counters;
 	struct TaskCtx *tctx = lookup_task_ctx(p);
-	struct CohortCtx *cohort;
-	u64 delta;
+	u64 delta, scaled;
+	u32 run_llc;
+	u64 *lload;
 
 	if (!tctx)
 		return;
 
 	delta = scx_bpf_now() - tctx->last_run_at;
+	scaled = delta * p->scx.weight / 100;
 	tctx->vtime += delta * 100 / p->scx.weight;
 	tctx->avg_runtime_ns = (tctx->avg_runtime_ns * 3 + delta) / 4;
 
-	cohort = bpf_map_lookup_elem(&cohorts, &tctx->cohort_id);
-	if (cohort)
-		__sync_fetch_and_add(&cohort->load_sum,
-				     delta * p->scx.weight / 100);
+	counters = bpf_map_lookup_elem(&cohort_counters, &tctx->cohort_id);
+	if (counters)
+		__sync_fetch_and_add(&counters->load_sum, scaled);
+
+	/* Executed load is charged to the LLC that actually ran the task. */
+	run_llc = llc_of_cpu(scx_bpf_task_cpu(p));
+	lload = bpf_map_lookup_elem(&llc_load, &run_llc);
+	if (lload)
+		__sync_fetch_and_add(lload, scaled);
 
 	{
 		u32 pid = p->pid;
@@ -568,12 +605,14 @@ static u64 assign_cohort(struct task_struct *p, bool fork)
 	}
 
 	if (id == COHORT_INVALID) {
-		struct CohortCtx cohort = {
+		struct CohortPolicy policy = {
 			.home_llc = __sync_fetch_and_add(&rr_ctr, 1) % nr_llcs,
 		};
+		struct CohortCounters counters = {};
 
 		id = __sync_fetch_and_add(&cohort_seq, 1) + 1;
-		bpf_map_update_elem(&cohorts, &id, &cohort, BPF_NOEXIST);
+		bpf_map_update_elem(&cohort_policy, &id, &policy, BPF_NOEXIST);
+		bpf_map_update_elem(&cohort_counters, &id, &counters, BPF_NOEXIST);
 	}
 
 	bpf_map_update_elem(&tgid_cohort, &tgid, &id, BPF_ANY);
@@ -583,7 +622,8 @@ static u64 assign_cohort(struct task_struct *p, bool fork)
 s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 		   struct scx_init_task_args *args)
 {
-	struct CohortCtx *cohort;
+	struct CohortCounters *counters;
+	struct CohortPolicy *policy;
 	struct TaskCtx *tctx;
 	u64 id;
 
@@ -595,10 +635,13 @@ s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 	id = assign_cohort(p, args->fork);
 	tctx->cohort_id = id;
 
-	cohort = bpf_map_lookup_elem(&cohorts, &id);
-	if (cohort) {
-		__sync_fetch_and_add(&cohort->nr_tasks, 1);
-		struct llc_ctx *llcx = lookup_llc_ctx(safe_llc(cohort->home_llc));
+	counters = bpf_map_lookup_elem(&cohort_counters, &id);
+	if (counters)
+		__sync_fetch_and_add(&counters->nr_tasks, 1);
+
+	policy = bpf_map_lookup_elem(&cohort_policy, &id);
+	if (policy) {
+		struct llc_ctx *llcx = lookup_llc_ctx(safe_llc(policy->home_llc));
 
 		tctx->vtime = llcx ? llcx->vtime_now : 0;
 	}
@@ -621,7 +664,7 @@ void BPF_STRUCT_OPS(cohort_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
 	struct TaskCtx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
-	struct CohortCtx *cohort;
+	struct CohortCounters *counters;
 	u64 id;
 
 	if (!tctx)
@@ -632,9 +675,9 @@ void BPF_STRUCT_OPS(cohort_exit_task, struct task_struct *p,
 	 * the decrement lands on the cohort that absorbed our count.
 	 */
 	id = resolve_cohort(p, tctx);
-	cohort = bpf_map_lookup_elem(&cohorts, &id);
-	if (cohort)
-		__sync_fetch_and_sub(&cohort->nr_tasks, 1);
+	counters = bpf_map_lookup_elem(&cohort_counters, &id);
+	if (counters)
+		__sync_fetch_and_sub(&counters->nr_tasks, 1);
 
 	{
 		u32 pid = p->pid;

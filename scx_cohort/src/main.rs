@@ -43,7 +43,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
 use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
-    CohortCtx, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, MAX_CPUS, MAX_LLCS, NR_STATS,
+    CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, MAX_CPUS,
+    MAX_LLCS, NR_STATS,
 };
 use wake_graph::{WakeGraph, WakeGraphCfg};
 
@@ -158,6 +159,14 @@ struct Scheduler<'a> {
     llc_cpus: BTreeMap<u32, u64>,
     /// cohort id → load_sum at the previous tick, for per-tick deltas.
     prev_load_sum: HashMap<u64, u64>,
+    /// llc → executed load at the previous tick, for per-tick deltas.
+    prev_llc_load: HashMap<u32, u64>,
+    /// Cohorts observed dead (no tgid references, no live tasks) last
+    /// tick; deleted only on the second consecutive observation, so the
+    /// GC can't race the BPF side's create-then-populate in init_task.
+    dead_cohorts: std::collections::HashSet<u64>,
+    /// Same two-tick treatment for tgid_cohort entries with no live tasks.
+    dead_tgids: std::collections::HashSet<u32>,
     wake_graph: WakeGraph,
     /// Raw (directed) edge counters at the previous tick.
     prev_edges: HashMap<(u32, u32), u64>,
@@ -258,6 +267,9 @@ impl<'a> Scheduler<'a> {
             }),
             llc_cpus,
             prev_load_sum: HashMap::new(),
+            prev_llc_load: HashMap::new(),
+            dead_cohorts: std::collections::HashSet::new(),
+            dead_tgids: std::collections::HashSet::new(),
             wake_graph: WakeGraph::new(WakeGraphCfg {
                 merge_wakes_per_sec: opts.merge_wakes_per_sec,
                 ..WakeGraphCfg::default()
@@ -292,45 +304,79 @@ impl<'a> Scheduler<'a> {
         self.started_at.elapsed().as_millis() as u64
     }
 
-    /// Snapshot the cohort map, computing per-tick load deltas, and
-    /// garbage-collect empty cohorts along the way.
-    fn snapshot_cohorts(&mut self) -> Result<Vec<CohortSnapshot>> {
-        let cohorts_map = &self.skel.maps.cohorts;
+    /// Snapshot cohort state from the counters and policy maps, deriving
+    /// exact membership from the task snapshot, and garbage-collect dead
+    /// cohorts (no tgid references, no live tasks — two ticks in a row).
+    ///
+    /// The daemon never writes an existing counters value back: counters
+    /// are BPF-owned, policy is daemon-owned, so no read-modify-write can
+    /// race the other side's atomics.
+    fn snapshot_cohorts(
+        &mut self,
+        tasks: &[TaskSnapshot],
+        tgid_cohort: &HashMap<u32, u64>,
+    ) -> Result<Vec<CohortSnapshot>> {
+        let counters_map = &self.skel.maps.cohort_counters;
+        let policy_map = &self.skel.maps.cohort_policy;
         let mut out = Vec::new();
         let mut dead = Vec::new();
         let mut seen = HashMap::new();
+        let mut dead_now = std::collections::HashSet::new();
 
-        for key in cohorts_map.keys() {
-            let Some(val) = cohorts_map.lookup(&key, MapFlags::ANY)? else {
+        let mut task_counts: HashMap<u64, u64> = HashMap::new();
+        for t in tasks {
+            *task_counts.entry(t.cohort_id).or_default() += 1;
+        }
+        let referenced: std::collections::HashSet<u64> =
+            tgid_cohort.values().copied().collect();
+
+        for key in counters_map.keys() {
+            let Some(val) = counters_map.lookup(&key, MapFlags::ANY)? else {
                 continue;
             };
-            let Ok(ctx) = CohortCtx::read_from_bytes(val.as_slice()) else {
-                warn!("cohort value size mismatch: {}", val.len());
+            let Ok(counters) = CohortCounters::read_from_bytes(val.as_slice()) else {
+                warn!("cohort counters size mismatch: {}", val.len());
                 continue;
             };
             let id = u64::from_ne_bytes(key.as_slice().try_into()?);
+            let nr_tasks = task_counts.get(&id).copied().unwrap_or(0);
 
-            if ctx.nr_tasks == 0 {
-                dead.push(key.clone());
+            if nr_tasks == 0 && !referenced.contains(&id) {
+                if self.dead_cohorts.contains(&id) {
+                    dead.push(id);
+                } else {
+                    dead_now.insert(id);
+                }
                 continue;
             }
 
-            let prev = self.prev_load_sum.get(&id).copied().unwrap_or(ctx.load_sum);
-            seen.insert(id, ctx.load_sum);
+            let policy = match policy_map.lookup(&key, MapFlags::ANY)? {
+                Some(v) => CohortPolicy::read_from_bytes(v.as_slice()).unwrap_or_default(),
+                None => CohortPolicy::default(),
+            };
+
+            let prev = self
+                .prev_load_sum
+                .get(&id)
+                .copied()
+                .unwrap_or(counters.load_sum);
+            seen.insert(id, counters.load_sum);
             out.push(CohortSnapshot {
                 id,
-                home_llc: ctx.home_llc,
-                pinned: ctx.flags & COHORT_PINNED != 0,
-                nr_tasks: ctx.nr_tasks,
-                load_ns: ctx.load_sum.saturating_sub(prev),
+                home_llc: policy.home_llc,
+                pinned: policy.flags & COHORT_PINNED != 0,
+                nr_tasks,
+                load_ns: counters.load_sum.saturating_sub(prev),
                 residency_ms: self.residency_overrides.get(&id).copied(),
             });
         }
 
-        for key in &dead {
-            let _ = cohorts_map.delete(key);
+        for id in &dead {
+            let key = id.to_ne_bytes();
+            let _ = counters_map.delete(&key);
+            let _ = policy_map.delete(&key);
         }
-        self.gc_tgid_map()?;
+        self.dead_cohorts = dead_now;
 
         self.prev_load_sum = seen;
         let live: std::collections::HashSet<u64> = out.iter().map(|c| c.id).collect();
@@ -338,26 +384,25 @@ impl<'a> Scheduler<'a> {
         Ok(out)
     }
 
-    /// Drop tgid→cohort entries whose cohort no longer exists, so a
-    /// recycled tgid can't resurrect a dead cohort.
-    fn gc_tgid_map(&self) -> Result<()> {
+    /// Drop tgid→cohort entries whose tgid has no live tasks (two ticks
+    /// in a row, so a freshly inserted mapping can't be swept before its
+    /// first task_stats entry appears).
+    fn gc_tgid_map(&mut self, tgid_cohort: &HashMap<u32, u64>, tasks: &[TaskSnapshot]) {
+        let live_tgids: std::collections::HashSet<u32> = tasks.iter().map(|t| t.tgid).collect();
+        let mut dead_now = std::collections::HashSet::new();
         let tgid_map = &self.skel.maps.tgid_cohort;
-        let cohorts_map = &self.skel.maps.cohorts;
-        let mut stale = Vec::new();
 
-        for key in tgid_map.keys() {
-            let Some(val) = tgid_map.lookup(&key, MapFlags::ANY)? else {
+        for &tgid in tgid_cohort.keys() {
+            if live_tgids.contains(&tgid) {
                 continue;
-            };
-            let cohort_key: [u8; 8] = val.as_slice().try_into()?;
-            if cohorts_map.lookup(&cohort_key, MapFlags::ANY)?.is_none() {
-                stale.push(key);
+            }
+            if self.dead_tgids.contains(&tgid) {
+                let _ = tgid_map.delete(&tgid.to_ne_bytes());
+            } else {
+                dead_now.insert(tgid);
             }
         }
-        for key in &stale {
-            let _ = tgid_map.delete(key);
-        }
-        Ok(())
+        self.dead_tgids = dead_now;
     }
 
     /// Per-tick deltas of the sampled wake-edge counters. LRU eviction can
@@ -438,13 +483,17 @@ impl<'a> Scheduler<'a> {
         if let Some(path) = self.cgroup_cache.get(&tgid) {
             return path.clone();
         }
-        // "0::/user.slice/..." — strip the header and the leading slash so
-        // globs like "user.slice/*" match naturally.
+        // Use the cgroup v2 line ("0::/user.slice/...") specifically: on
+        // hybrid v1+v2 hosts the v1 controller lines come first and would
+        // otherwise win. Strip the leading slash so globs like
+        // "user.slice/*" match naturally.
         let path = std::fs::read_to_string(format!("/proc/{tgid}/cgroup"))
             .ok()
             .and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.splitn(3, ':').nth(2).map(|p| p.trim_start_matches('/').to_string()))
+                s.lines().find_map(|l| {
+                    l.strip_prefix("0::")
+                        .map(|p| p.trim_start_matches('/').to_string())
+                })
             })
             .unwrap_or_default();
         self.cgroup_cache.insert(tgid, path.clone());
@@ -463,44 +512,42 @@ impl<'a> Scheduler<'a> {
 
         let mut overrides = HashMap::new();
         let mut pins: HashMap<u64, u32> = HashMap::new();
-        // Borrow-check friendly two-step: resolve cgroups first.
-        let matches: Vec<(u64, Option<u32>, Option<u64>)> = tasks
-            .iter()
-            .map(|t| (t.clone(), self.cgroup_of(t.tgid)))
-            .collect::<Vec<_>>()
-            .iter()
-            .filter_map(|(t, cgroup)| {
-                self.config
-                    .match_task(&t.comm, cgroup)
-                    .map(|r| (t.cohort_id, r.pin_ccd, r.min_ccd_residency_ms))
-            })
-            .collect();
-        for (cohort, pin, residency) in matches {
+        for t in tasks {
+            let cgroup = self.cgroup_of(t.tgid);
+            // Copy the matched rule's effects out immediately so the
+            // borrow of self.config doesn't outlive this iteration.
+            let Some((pin, residency)) = self
+                .config
+                .match_task(&t.comm, &cgroup)
+                .map(|r| (r.pin_ccd, r.min_ccd_residency_ms))
+            else {
+                continue;
+            };
             if let Some(ms) = residency {
-                let e = overrides.entry(cohort).or_insert(ms);
+                let e = overrides.entry(t.cohort_id).or_insert(ms);
                 *e = (*e).max(ms);
             }
             if let Some(ccd) = pin {
-                pins.insert(cohort, ccd);
+                pins.insert(t.cohort_id, ccd);
             }
         }
         self.residency_overrides = overrides;
 
-        let cohorts_map = &self.skel.maps.cohorts;
+        let policy_map = &self.skel.maps.cohort_policy;
         for (cohort, ccd) in pins {
             let key = cohort.to_ne_bytes();
-            let Some(val) = cohorts_map.lookup(&key, MapFlags::ANY)? else {
+            let Some(val) = policy_map.lookup(&key, MapFlags::ANY)? else {
                 continue;
             };
-            let Ok(mut ctx) = CohortCtx::read_from_bytes(val.as_slice()) else {
+            let Ok(mut policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
                 continue;
             };
             let want_home = ccd.min(self.llc_cpus.len() as u32 - 1);
-            if ctx.flags & COHORT_PINNED == 0 || ctx.home_llc != want_home {
+            if policy.flags & COHORT_PINNED == 0 || policy.home_llc != want_home {
                 debug!("pinning cohort {} to LLC {}", cohort, want_home);
-                ctx.flags |= COHORT_PINNED;
-                ctx.home_llc = want_home;
-                cohorts_map.update(&key, ctx.as_bytes(), MapFlags::EXIST)?;
+                policy.flags |= COHORT_PINNED;
+                policy.home_llc = want_home;
+                policy_map.update(&key, policy.as_bytes(), MapFlags::EXIST)?;
             }
         }
         Ok(())
@@ -524,33 +571,23 @@ impl<'a> Scheduler<'a> {
     }
 
     fn apply_merge(&mut self, plan: wake_graph::MergePlan) -> Result<()> {
-        let cohorts_map = &self.skel.maps.cohorts;
+        let counters_map = &self.skel.maps.cohort_counters;
+        let policy_map = &self.skel.maps.cohort_policy;
         let into_key = plan.into.to_ne_bytes();
         let from_key = plan.from.to_ne_bytes();
 
-        let (Some(into_val), Some(from_val)) = (
-            cohorts_map.lookup(&into_key, MapFlags::ANY)?,
-            cohorts_map.lookup(&from_key, MapFlags::ANY)?,
-        ) else {
+        if counters_map.lookup(&into_key, MapFlags::ANY)?.is_none()
+            || counters_map.lookup(&from_key, MapFlags::ANY)?.is_none()
+        {
             return Ok(());
-        };
-        let (Ok(mut into_ctx), Ok(from_ctx)) = (
-            CohortCtx::read_from_bytes(into_val.as_slice()),
-            CohortCtx::read_from_bytes(from_val.as_slice()),
-        ) else {
-            return Ok(());
-        };
+        }
 
-        info!(
-            "merging cohort {} ({} tasks) into {} ({} tasks)",
-            plan.from, from_ctx.nr_tasks, plan.into, into_ctx.nr_tasks
-        );
+        info!("merging cohort {} into {}", plan.from, plan.into);
 
-        // Membership transfers through tgid_cohort (the BPF side resolves
-        // through it on every wakeup), and the member count moves with it.
-        into_ctx.nr_tasks += from_ctx.nr_tasks;
-        cohorts_map.update(&into_key, into_ctx.as_bytes(), MapFlags::EXIST)?;
-
+        // Membership transfers through tgid_cohort alone: the BPF side
+        // resolves through it on every wakeup, exit decrements land on
+        // the absorbing cohort, and the daemon derives member counts from
+        // task_stats — no counter needs rewriting.
         let tgid_map = &self.skel.maps.tgid_cohort;
         for key in tgid_map.keys() {
             let Some(val) = tgid_map.lookup(&key, MapFlags::ANY)? else {
@@ -561,54 +598,50 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        cohorts_map.delete(&from_key)?;
+        let _ = counters_map.delete(&from_key);
+        let _ = policy_map.delete(&from_key);
         self.prev_load_sum.remove(&plan.from);
         self.nr_merges += 1;
         Ok(())
     }
 
-    fn apply_split(
-        &mut self,
-        plan: wake_graph::SplitPlan,
-        tgid_tasks: &HashMap<u32, u64>,
-    ) -> Result<()> {
-        let cohorts_map = &self.skel.maps.cohorts;
+    fn apply_split(&mut self, plan: wake_graph::SplitPlan) -> Result<()> {
+        let counters_map = &self.skel.maps.cohort_counters;
+        let policy_map = &self.skel.maps.cohort_policy;
         let old_key = plan.cohort.to_ne_bytes();
-        let Some(old_val) = cohorts_map.lookup(&old_key, MapFlags::ANY)? else {
+        let Some(old_val) = policy_map.lookup(&old_key, MapFlags::ANY)? else {
             return Ok(());
         };
-        let Ok(mut old_ctx) = CohortCtx::read_from_bytes(old_val.as_slice()) else {
+        let Ok(old_policy) = CohortPolicy::read_from_bytes(old_val.as_slice()) else {
             return Ok(());
         };
 
-        let moved_tasks: u64 = plan
-            .off_tgids
-            .iter()
-            .map(|t| tgid_tasks.get(t).copied().unwrap_or(0))
-            .sum();
         let new_id = DAEMON_COHORT_BASE + self.daemon_seq;
         self.daemon_seq += 1;
 
         info!(
-            "splitting {} tgids ({} tasks) out of cohort {} into {}",
+            "splitting {} tgids out of cohort {} into {}",
             plan.off_tgids.len(),
-            moved_tasks,
             plan.cohort,
             new_id
         );
 
         // The new cohort starts at the same home; if the machine is
         // imbalanced afterwards, the balancer moves it — placement policy
-        // stays in one place.
-        let new_ctx = CohortCtx {
-            home_llc: old_ctx.home_llc,
+        // stays in one place. Member counts are daemon-derived, so only
+        // fresh entries are written; nothing existing is rewritten.
+        let new_policy = CohortPolicy {
+            home_llc: old_policy.home_llc,
             flags: 0,
-            nr_tasks: moved_tasks,
-            load_sum: 0,
         };
-        cohorts_map.update(
+        policy_map.update(
             &new_id.to_ne_bytes(),
-            new_ctx.as_bytes(),
+            new_policy.as_bytes(),
+            MapFlags::NO_EXIST,
+        )?;
+        counters_map.update(
+            &new_id.to_ne_bytes(),
+            CohortCounters::default().as_bytes(),
             MapFlags::NO_EXIST,
         )?;
 
@@ -620,11 +653,6 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        // Best-effort count transfer: BPF-side init/exit updates racing
-        // this read-modify-write can skew nr_tasks slightly; the counter
-        // is advisory (GC + balancer filters), not load-bearing.
-        old_ctx.nr_tasks = old_ctx.nr_tasks.saturating_sub(moved_tasks);
-        cohorts_map.update(&old_key, old_ctx.as_bytes(), MapFlags::EXIST)?;
         self.nr_splits += 1;
         Ok(())
     }
@@ -633,16 +661,16 @@ impl<'a> Scheduler<'a> {
         &mut self,
         cohorts: &[CohortSnapshot],
         tasks: &[TaskSnapshot],
+        tgid_cohort: &HashMap<u32, u64>,
     ) -> Result<()> {
         let dt_s = self.interval.as_secs_f64();
         let deltas = self.snapshot_edges()?;
         self.wake_graph.observe(&deltas, dt_s, self.sample_mult);
 
-        let tgid_cohort = self.snapshot_tgid_cohort()?;
         let cohort_sizes: HashMap<u64, u64> =
             cohorts.iter().map(|c| (c.id, c.nr_tasks)).collect();
 
-        for plan in self.wake_graph.merges(&tgid_cohort, &cohort_sizes) {
+        for plan in self.wake_graph.merges(tgid_cohort, &cohort_sizes) {
             self.apply_merge(plan)?;
         }
 
@@ -651,7 +679,7 @@ impl<'a> Scheduler<'a> {
             *tgid_tasks.entry(t.tgid).or_default() += 1;
         }
         let mut cohort_tgids: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
-        for (&tgid, &cohort) in &tgid_cohort {
+        for (&tgid, &cohort) in tgid_cohort {
             if cohort_sizes.contains_key(&cohort) {
                 cohort_tgids.entry(cohort).or_default().push((
                     tgid,
@@ -660,42 +688,50 @@ impl<'a> Scheduler<'a> {
             }
         }
         for plan in self.wake_graph.splits(&cohort_tgids) {
-            self.apply_split(plan, &tgid_tasks)?;
+            self.apply_split(plan)?;
         }
         Ok(())
     }
 
-    fn llc_loads(&self, cohorts: &[CohortSnapshot]) -> Vec<LlcLoad> {
+    /// Per-LLC executed load: what actually ran where this tick, from the
+    /// BPF-side llc_load counters. Spilled and stolen work counts at the
+    /// LLC that ran it, so the imbalance signal converges.
+    fn llc_loads(&mut self) -> Result<Vec<LlcLoad>> {
         let tick_ns = self.interval.as_nanos() as u64;
-        self.llc_cpus
-            .iter()
-            .map(|(&llc, &cpus)| LlcLoad {
+        let map = &self.skel.maps.llc_load;
+        let mut out = Vec::new();
+
+        for (&llc, &cpus) in &self.llc_cpus {
+            let cur = map
+                .lookup(&llc.to_ne_bytes(), MapFlags::ANY)?
+                .map(|v| u64::from_ne_bytes(v.as_slice().try_into().unwrap_or([0; 8])))
+                .unwrap_or(0);
+            let prev = self.prev_llc_load.get(&llc).copied().unwrap_or(cur);
+            self.prev_llc_load.insert(llc, cur);
+            out.push(LlcLoad {
                 llc,
-                load_ns: cohorts
-                    .iter()
-                    .filter(|c| c.home_llc == llc)
-                    .map(|c| c.load_ns)
-                    .sum(),
+                load_ns: cur.saturating_sub(prev),
                 capacity_ns: cpus * tick_ns,
-            })
-            .collect()
+            });
+        }
+        Ok(out)
     }
 
     fn apply(&mut self, decisions: Vec<Decision>) -> Result<()> {
-        let cohorts_map = &self.skel.maps.cohorts;
+        let policy_map = &self.skel.maps.cohort_policy;
         for decision in decisions {
             match decision {
                 Decision::MoveCohort { id, to } => {
                     let key = id.to_ne_bytes();
-                    let Some(val) = cohorts_map.lookup(&key, MapFlags::ANY)? else {
+                    let Some(val) = policy_map.lookup(&key, MapFlags::ANY)? else {
                         continue;
                     };
-                    let Ok(mut ctx) = CohortCtx::read_from_bytes(val.as_slice()) else {
+                    let Ok(mut policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
                         continue;
                     };
-                    debug!("moving cohort {} from LLC {} to {}", id, ctx.home_llc, to);
-                    ctx.home_llc = to;
-                    cohorts_map.update(&key, ctx.as_bytes(), MapFlags::EXIST)?;
+                    debug!("moving cohort {} from LLC {} to {}", id, policy.home_llc, to);
+                    policy.home_llc = to;
+                    policy_map.update(&key, policy.as_bytes(), MapFlags::EXIST)?;
                     self.nr_migrations += 1;
                 }
             }
@@ -722,22 +758,21 @@ impl<'a> Scheduler<'a> {
         use scx_cohort_common::*;
 
         let c = self.read_stat_counters().unwrap_or_default();
-        let direct = c[STAT_SYNC_LOCAL as usize]
-            + c[STAT_PREV_IDLE as usize]
-            + c[STAT_IDLE_CORE as usize]
-            + c[STAT_IDLE_SMT as usize];
-        let home = direct + c[STAT_ENQ_HOME as usize];
-        let away = c[STAT_ENQ_SPILL as usize] + c[STAT_STEAL as usize];
-        let total = home + away;
 
         stats::Metrics {
             nr_cohorts: cohorts.len() as u64,
             nr_tasks: cohorts.iter().map(|c| c.nr_tasks).sum(),
-            affinity_hit_pct: if total > 0 {
-                home as f64 * 100.0 / total as f64
-            } else {
-                100.0
-            },
+            // Recomputed from counters (cumulatively here, per-interval in
+            // Metrics::delta) — see stats::affinity_pct for the formula.
+            affinity_hit_pct: stats::affinity_pct(
+                c[STAT_SYNC_LOCAL as usize]
+                    + c[STAT_PREV_IDLE as usize]
+                    + c[STAT_IDLE_CORE as usize]
+                    + c[STAT_IDLE_SMT as usize],
+                c[STAT_ENQ_HOME as usize],
+                c[STAT_ENQ_SPILL as usize],
+                c[STAT_STEAL as usize],
+            ),
             nr_sync_local: c[STAT_SYNC_LOCAL as usize],
             nr_prev_idle: c[STAT_PREV_IDLE as usize],
             nr_idle_core: c[STAT_IDLE_CORE as usize],
@@ -769,9 +804,11 @@ impl<'a> Scheduler<'a> {
 
     fn tick(&mut self) -> Result<(Vec<CohortSnapshot>, Vec<LlcLoad>)> {
         let tasks = self.snapshot_tasks()?;
+        let tgid_cohort = self.snapshot_tgid_cohort()?;
         self.apply_rules(&tasks)?;
-        let cohorts = self.snapshot_cohorts()?;
-        let llcs = self.llc_loads(&cohorts);
+        let cohorts = self.snapshot_cohorts(&tasks, &tgid_cohort)?;
+        self.gc_tgid_map(&tgid_cohort, &tasks);
+        let llcs = self.llc_loads()?;
         let decisions = self.balancer.plan(self.now_ms(), &llcs, &cohorts);
         self.apply(decisions)?;
         let desired = plan_spills(
@@ -782,7 +819,7 @@ impl<'a> Scheduler<'a> {
             &self.current_spills,
         );
         self.apply_spills(desired)?;
-        self.discover_relationships(&cohorts, &tasks)?;
+        self.discover_relationships(&cohorts, &tasks, &tgid_cohort)?;
         Ok((cohorts, llcs))
     }
 

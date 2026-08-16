@@ -184,6 +184,11 @@ impl WakeGraph {
     pub fn splits(&mut self, cohort_tgids: &HashMap<u64, Vec<(u32, u64)>>) -> Vec<SplitPlan> {
         let mut out = Vec::new();
 
+        // Cohorts that no longer exist must not leak their streaks (ids
+        // are never reused, so a stale entry would live forever).
+        self.split_streak
+            .retain(|cohort, _| cohort_tgids.contains_key(cohort));
+
         for (&cohort, members) in cohort_tgids {
             if members.len() < 2 {
                 self.split_streak.remove(&cohort);

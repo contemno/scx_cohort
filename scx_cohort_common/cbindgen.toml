@@ -22,7 +22,7 @@ typedef __s64 int64_t;
 #endif"""
 
 [export]
-include = ["TaskCtx", "CohortCtx", "WakeEdgeKey", "TaskStat", "Tunables"]
+include = ["TaskCtx", "CohortPolicy", "CohortCounters", "WakeEdgeKey", "TaskStat", "Tunables"]
 
 [const]
 allow_static_const = false
