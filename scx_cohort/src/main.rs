@@ -53,6 +53,11 @@ use wake_graph::{WakeGraph, WakeGraphCfg};
 /// spaces collision-free.
 const DAEMON_COHORT_BASE: u64 = 1 << 32;
 
+/// Entries fetched per batched-map syscall. The per-tick snapshots use
+/// batch ops throughout: per-key iteration costs two syscalls per entry
+/// and was measured at ~14% of a CPU on a desktop task load.
+const BATCH: u32 = 512;
+
 /// scx_cohort: A CCD-affine sched_ext scheduler.
 ///
 /// Discovers groups of related tasks ("cohorts"), gives each cohort a home
@@ -168,8 +173,6 @@ struct Scheduler<'a> {
     /// Same two-tick treatment for tgid_cohort entries with no live tasks.
     dead_tgids: std::collections::HashSet<u32>,
     wake_graph: WakeGraph,
-    /// Raw (directed) edge counters at the previous tick.
-    prev_edges: HashMap<(u32, u32), u64>,
     /// Allocator for split-off cohort ids (offset from DAEMON_COHORT_BASE).
     daemon_seq: u64,
     sample_mult: u64,
@@ -283,7 +286,6 @@ impl<'a> Scheduler<'a> {
                 merge_wakes_per_sec: opts.merge_wakes_per_sec,
                 ..WakeGraphCfg::default()
             }),
-            prev_edges: HashMap::new(),
             daemon_seq: 0,
             sample_mult: 1 << opts.tunables().sample_shift,
             config: match &opts.config {
@@ -339,10 +341,20 @@ impl<'a> Scheduler<'a> {
         let referenced: std::collections::HashSet<u64> =
             tgid_cohort.values().copied().collect();
 
-        for key in counters_map.keys() {
-            let Some(val) = counters_map.lookup(&key, MapFlags::ANY)? else {
-                continue;
-            };
+        // A failed/empty task scan must not read as "every cohort died".
+        let gc_safe = !tasks.is_empty();
+
+        let mut policies: HashMap<u64, CohortPolicy> = HashMap::new();
+        for (key, val) in policy_map.lookup_batch(BATCH, MapFlags::ANY, MapFlags::ANY)? {
+            if let (Ok(id), Ok(policy)) = (
+                key.as_slice().try_into().map(u64::from_ne_bytes),
+                CohortPolicy::read_from_bytes(val.as_slice()),
+            ) {
+                policies.insert(id, policy);
+            }
+        }
+
+        for (key, val) in counters_map.lookup_batch(BATCH, MapFlags::ANY, MapFlags::ANY)? {
             let Ok(counters) = CohortCounters::read_from_bytes(val.as_slice()) else {
                 warn!("cohort counters size mismatch: {}", val.len());
                 continue;
@@ -351,6 +363,9 @@ impl<'a> Scheduler<'a> {
             let nr_tasks = task_counts.get(&id).copied().unwrap_or(0);
 
             if nr_tasks == 0 && !referenced.contains(&id) {
+                if !gc_safe {
+                    continue;
+                }
                 if self.dead_cohorts.contains(&id) {
                     dead.push(id);
                 } else {
@@ -359,11 +374,7 @@ impl<'a> Scheduler<'a> {
                 continue;
             }
 
-            let policy = match policy_map.lookup(&key, MapFlags::ANY)? {
-                Some(v) => CohortPolicy::read_from_bytes(v.as_slice()).unwrap_or_default(),
-                None => CohortPolicy::default(),
-            };
-
+            let policy = policies.get(&id).copied().unwrap_or_default();
             let prev = self
                 .prev_load_sum
                 .get(&id)
@@ -378,6 +389,10 @@ impl<'a> Scheduler<'a> {
                 load_ns: counters.load_sum.saturating_sub(prev),
                 residency_ms: self.residency_overrides.get(&id).copied(),
             });
+        }
+
+        if !gc_safe && !policies.is_empty() {
+            warn!("empty task snapshot with live cohorts; skipping GC this tick");
         }
 
         for id in &dead {
@@ -414,30 +429,24 @@ impl<'a> Scheduler<'a> {
         self.dead_tgids = dead_now;
     }
 
-    /// Per-tick deltas of the sampled wake-edge counters. LRU eviction can
-    /// reset a counter; a decrease is treated as a fresh count.
+    /// Per-tick sampled wake-edge counts, drained from the LRU map in one
+    /// batched pass: the removed values are the deltas directly, and
+    /// draining keeps the map sparse so every scan stays small. An
+    /// increment racing between lookup and delete is occasionally lost —
+    /// noise for sampled counters.
     fn snapshot_edges(&mut self) -> Result<Vec<(u32, u32, u64)>> {
         let map = &self.skel.maps.wake_edges;
-        let mut cur = HashMap::new();
         let mut deltas = Vec::new();
 
-        for key in map.keys() {
-            let Some(val) = map.lookup(&key, MapFlags::ANY)? else {
-                continue;
-            };
+        for (key, val) in map.lookup_and_delete_batch(BATCH, MapFlags::ANY, MapFlags::ANY)? {
             let Ok(edge) = WakeEdgeKey::read_from_bytes(key.as_slice()) else {
                 continue;
             };
             let count = u64::from_ne_bytes(val.as_slice().try_into()?);
-            let k = (edge.waker_tgid, edge.wakee_tgid);
-            let prev = self.prev_edges.get(&k).copied().unwrap_or(0);
-            let delta = if count >= prev { count - prev } else { count };
-            if delta > 0 {
-                deltas.push((k.0, k.1, delta));
+            if count > 0 {
+                deltas.push((edge.waker_tgid, edge.wakee_tgid, count));
             }
-            cur.insert(k, count);
         }
-        self.prev_edges = cur;
         Ok(deltas)
     }
 
@@ -445,10 +454,7 @@ impl<'a> Scheduler<'a> {
     fn snapshot_tgid_cohort(&self) -> Result<HashMap<u32, u64>> {
         let map = &self.skel.maps.tgid_cohort;
         let mut out = HashMap::new();
-        for key in map.keys() {
-            let Some(val) = map.lookup(&key, MapFlags::ANY)? else {
-                continue;
-            };
+        for (key, val) in map.lookup_batch(BATCH, MapFlags::ANY, MapFlags::ANY)? {
             out.insert(
                 u32::from_ne_bytes(key.as_slice().try_into()?),
                 u64::from_ne_bytes(val.as_slice().try_into()?),
@@ -464,10 +470,7 @@ impl<'a> Scheduler<'a> {
         let mut out = Vec::new();
         let mut seen = HashMap::new();
 
-        for key in map.keys() {
-            let Some(val) = map.lookup(&key, MapFlags::ANY)? else {
-                continue;
-            };
+        for (key, val) in map.lookup_batch(BATCH, MapFlags::ANY, MapFlags::ANY)? {
             let Ok(ts) = TaskStat::read_from_bytes(val.as_slice()) else {
                 continue;
             };
@@ -579,7 +582,11 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn apply_merge(&mut self, plan: wake_graph::MergePlan) -> Result<()> {
+    fn apply_merge(
+        &mut self,
+        plan: wake_graph::MergePlan,
+        tgid_cohort: &HashMap<u32, u64>,
+    ) -> Result<()> {
         let counters_map = &self.skel.maps.cohort_counters;
         let policy_map = &self.skel.maps.cohort_policy;
         let into_key = plan.into.to_ne_bytes();
@@ -596,14 +603,16 @@ impl<'a> Scheduler<'a> {
         // Membership transfers through tgid_cohort alone: the BPF side
         // resolves through it on every wakeup, exit decrements land on
         // the absorbing cohort, and the daemon derives member counts from
-        // task_stats — no counter needs rewriting.
+        // task_stats — no counter needs rewriting. The tick's snapshot
+        // tells us which entries to touch; no map rescan.
         let tgid_map = &self.skel.maps.tgid_cohort;
-        for key in tgid_map.keys() {
-            let Some(val) = tgid_map.lookup(&key, MapFlags::ANY)? else {
-                continue;
-            };
-            if u64::from_ne_bytes(val.as_slice().try_into()?) == plan.from {
-                tgid_map.update(&key, &plan.into.to_ne_bytes(), MapFlags::EXIST)?;
+        for (&tgid, &cohort) in tgid_cohort {
+            if cohort == plan.from {
+                let _ = tgid_map.update(
+                    &tgid.to_ne_bytes(),
+                    &plan.into.to_ne_bytes(),
+                    MapFlags::EXIST,
+                );
             }
         }
 
@@ -680,7 +689,7 @@ impl<'a> Scheduler<'a> {
             cohorts.iter().map(|c| (c.id, c.nr_tasks)).collect();
 
         for plan in self.wake_graph.merges(tgid_cohort, &cohort_sizes) {
-            self.apply_merge(plan)?;
+            self.apply_merge(plan, tgid_cohort)?;
         }
 
         let mut tgid_tasks: HashMap<u32, u64> = HashMap::new();
@@ -846,7 +855,9 @@ impl<'a> Scheduler<'a> {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     last_view = self.tick()?;
-                    next_tick += self.interval;
+                    // Anchor to now, not the schedule: one slow tick must
+                    // not queue a burst of zero-timeout catch-up ticks.
+                    next_tick = Instant::now() + self.interval;
                 }
                 Err(e) => Err(e)?,
             }
