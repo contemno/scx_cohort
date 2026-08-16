@@ -60,6 +60,10 @@ The scheduler detaches (falling back to EEVDF) on Ctrl-C, on any daemon
 exit, via the sched_ext watchdog if a runnable task ever starves past the
 timeout, or manually with SysRq-S.
 
+Root is required (loading sched_ext programs needs CAP_BPF +
+CAP_SYS_ADMIN); an unprivileged run fails with EPERM. If the load fails
+with EINVAL, rerun with `-vv` to print the libbpf/verifier log.
+
 Watch it work:
 
 ```sh
