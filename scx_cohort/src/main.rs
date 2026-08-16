@@ -15,6 +15,7 @@ mod bpf_skel;
 mod config;
 mod domain;
 mod stats;
+mod top;
 mod wake_graph;
 
 pub use bpf_skel::*;
@@ -98,9 +99,11 @@ struct Opts {
     #[clap(long, default_value = "300")]
     merge_wakes_per_sec: f64,
 
-    /// Path to a TOML rules file (see config.rs for the format).
-    #[clap(long)]
-    config: Option<std::path::PathBuf>,
+    /// Path to the TOML config file ([options] + [[rule]] tables; see
+    /// README). The default path is optional: absent means defaults, but
+    /// an explicitly passed path must exist.
+    #[clap(long, default_value = "/etc/scx_cohort.conf")]
+    config: std::path::PathBuf,
 
     /// Enable stats monitoring with the specified interval in seconds.
     #[clap(long)]
@@ -111,9 +114,28 @@ struct Opts {
     #[clap(long)]
     monitor: Option<f64>,
 
+    /// Don't raise the daemon to realtime priority (SCHED_FIFO). RT keeps
+    /// the daemon from ever being starved by the scheduling class it
+    /// itself implements.
+    #[clap(long)]
+    no_rt: bool,
+
     /// Increase verbosity (-v: debug, -vv: trace).
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    #[clap(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Live per-cohort/per-process view (requires a running scheduler).
+    Top {
+        /// Refresh interval in seconds.
+        #[clap(long, default_value = "2")]
+        interval: f64,
+    },
 }
 
 impl Opts {
@@ -176,12 +198,12 @@ struct Scheduler<'a> {
     /// Allocator for split-off cohort ids (offset from DAEMON_COHORT_BASE).
     daemon_seq: u64,
     sample_mult: u64,
-    config: config::Config,
+    config: Arc<config::Config>,
     spill_cfg: SpillCfg,
     /// The spill set as last written to the BPF map: pid → target LLC.
     current_spills: HashMap<u32, u32>,
-    /// pid → runtime_sum at the previous tick, for duty deltas.
-    prev_runtime: HashMap<u32, u64>,
+    /// pid → (runtime_sum, runtime_home_sum) at the previous tick.
+    prev_runtime: HashMap<u32, (u64, u64)>,
     /// tgid → cgroup path, lazily read from procfs for rule matching.
     cgroup_cache: HashMap<u32, String>,
     /// cohort → residency override from matched rules.
@@ -189,11 +211,17 @@ struct Scheduler<'a> {
     nr_migrations: u64,
     nr_merges: u64,
     nr_splits: u64,
-    stats_server: StatsServer<(), stats::Metrics>,
+    /// Last tick's task snapshot, for the procs (top) view.
+    last_tasks: Vec<TaskSnapshot>,
+    stats_server: StatsServer<stats::StatsReq, stats::StatsRes>,
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+    fn init(
+        opts: &Opts,
+        config: Arc<config::Config>,
+        open_object: &'a mut MaybeUninit<OpenObject>,
+    ) -> Result<Self> {
         if unsafe { libc::geteuid() } != 0 {
             bail!(
                 "scx_cohort must run as root to load its BPF scheduler \
@@ -288,14 +316,7 @@ impl<'a> Scheduler<'a> {
             }),
             daemon_seq: 0,
             sample_mult: 1 << opts.tunables().sample_shift,
-            config: match &opts.config {
-                Some(path) => {
-                    let cfg = config::Config::load(path)?;
-                    info!("loaded {} rule(s) from {:?}", cfg.rules.len(), path);
-                    cfg
-                }
-                None => config::Config::default(),
-            },
+            config,
             spill_cfg: SpillCfg {
                 tick_ns: opts.interval_ms * 1_000_000,
                 ..SpillCfg::default()
@@ -307,6 +328,7 @@ impl<'a> Scheduler<'a> {
             nr_migrations: 0,
             nr_merges: 0,
             nr_splits: 0,
+            last_tasks: Vec::new(),
             stats_server,
         })
     }
@@ -475,8 +497,12 @@ impl<'a> Scheduler<'a> {
                 continue;
             };
             let pid = u32::from_ne_bytes(key.as_slice().try_into()?);
-            let prev = self.prev_runtime.get(&pid).copied().unwrap_or(ts.runtime_sum);
-            seen.insert(pid, ts.runtime_sum);
+            let (prev, prev_home) = self
+                .prev_runtime
+                .get(&pid)
+                .copied()
+                .unwrap_or((ts.runtime_sum, ts.runtime_home_sum));
+            seen.insert(pid, (ts.runtime_sum, ts.runtime_home_sum));
 
             let comm_len = ts.comm.iter().position(|&b| b == 0).unwrap_or(ts.comm.len());
             out.push(TaskSnapshot {
@@ -484,6 +510,7 @@ impl<'a> Scheduler<'a> {
                 tgid: ts.tgid,
                 cohort_id: ts.cohort_id,
                 duty_ns: ts.runtime_sum.saturating_sub(prev),
+                home_ns: ts.runtime_home_sum.saturating_sub(prev_home),
                 comm: String::from_utf8_lossy(&ts.comm[..comm_len]).into_owned(),
             });
         }
@@ -838,6 +865,7 @@ impl<'a> Scheduler<'a> {
         );
         self.apply_spills(desired)?;
         self.discover_relationships(&cohorts, &tasks, &tgid_cohort)?;
+        self.last_tasks = tasks;
         Ok((cohorts, llcs))
     }
 
@@ -849,9 +877,19 @@ impl<'a> Scheduler<'a> {
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             let timeout = next_tick.saturating_duration_since(Instant::now());
             match req_ch.recv_timeout(timeout) {
-                Ok(()) => {
+                Ok(stats::StatsReq::Metrics) => {
                     let metrics = self.get_metrics(&last_view.0, &last_view.1);
-                    res_ch.send(metrics)?;
+                    res_ch.send(stats::StatsRes::Metrics(metrics))?;
+                }
+                Ok(stats::StatsReq::Procs) => {
+                    let snapshot = stats::procs_snapshot(
+                        &last_view.0,
+                        &self.last_tasks,
+                        &last_view.1,
+                        &self.current_spills,
+                        self.interval,
+                    );
+                    res_ch.send(stats::StatsRes::Procs(snapshot))?;
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     last_view = self.tick()?;
@@ -866,24 +904,95 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+/// Raise the daemon to SCHED_FIFO so it can never be starved by the
+/// scheduling class it itself implements (RT sits above sched_ext).
+fn set_realtime(priority: i32) {
+    let param = libc::sched_param {
+        sched_priority: priority,
+    };
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
+        warn!(
+            "failed to set SCHED_FIFO {}: {}",
+            priority,
+            std::io::Error::last_os_error()
+        );
+    } else {
+        info!("daemon running at SCHED_FIFO {}", priority);
+    }
+}
+
+/// Load the config file and fold its `[options]` into `opts`, respecting
+/// precedence: built-in defaults < `[options]` < explicitly passed flags.
+fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Config> {
+    use clap::parser::ValueSource;
+
+    let explicit = matches.value_source("config") == Some(ValueSource::CommandLine);
+    let cfg = if opts.config.exists() {
+        let cfg = config::Config::load(&opts.config)?;
+        info!(
+            "loaded {} rule(s) from {:?}",
+            cfg.rules.len(),
+            opts.config
+        );
+        cfg
+    } else if explicit {
+        bail!("config file {:?} not found", opts.config);
+    } else {
+        config::Config::default()
+    };
+
+    let from_cli = |name: &str| matches.value_source(name) == Some(ValueSource::CommandLine);
+    let o = &cfg.options;
+    macro_rules! apply {
+        ($field:ident) => {
+            if let Some(v) = o.$field {
+                if !from_cli(stringify!($field)) {
+                    opts.$field = v;
+                }
+            }
+        };
+    }
+    apply!(slice_us);
+    apply!(interval_ms);
+    apply!(steal_min);
+    apply!(steal_delay_us);
+    apply!(imbalance_pct);
+    apply!(residency_ms);
+    apply!(merge_wakes_per_sec);
+
+    Ok(cfg)
+}
+
 fn main() -> Result<()> {
-    let opts = Opts::parse();
+    let matches = <Opts as clap::CommandFactory>::command().get_matches();
+    let mut opts = <Opts as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
     let level = match opts.verbose {
         0 => simplelog::LevelFilter::Info,
         1 => simplelog::LevelFilter::Debug,
         _ => simplelog::LevelFilter::Trace,
     };
+    // Under journald (systemd sets JOURNAL_STREAM when it owns stderr),
+    // skip our own timestamps/colors — the journal stamps entries itself.
+    let journald = std::env::var_os("JOURNAL_STREAM").is_some();
     let mut lcfg = simplelog::ConfigBuilder::new();
-    lcfg.set_time_level(simplelog::LevelFilter::Error)
-        .set_location_level(simplelog::LevelFilter::Off)
-        .set_target_level(simplelog::LevelFilter::Off)
-        .set_thread_level(simplelog::LevelFilter::Off);
+    lcfg.set_time_level(if journald {
+        simplelog::LevelFilter::Off
+    } else {
+        simplelog::LevelFilter::Error
+    })
+    .set_location_level(simplelog::LevelFilter::Off)
+    .set_target_level(simplelog::LevelFilter::Off)
+    .set_thread_level(simplelog::LevelFilter::Off);
     simplelog::TermLogger::init(
         level,
         lcfg.build(),
         simplelog::TerminalMode::Stderr,
-        simplelog::ColorChoice::Auto,
+        if journald {
+            simplelog::ColorChoice::Never
+        } else {
+            simplelog::ColorChoice::Auto
+        },
     )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -892,6 +1001,10 @@ fn main() -> Result<()> {
         shutdown_clone.store(true, Ordering::Relaxed);
     })
     .context("error setting Ctrl-C handler")?;
+
+    if let Some(Command::Top { interval }) = &opts.command {
+        return top::run(Duration::from_secs_f64(*interval), shutdown);
+    }
 
     if let Some(intv) = opts.monitor {
         return stats::monitor(Duration::from_secs_f64(intv), shutdown);
@@ -904,9 +1017,28 @@ fn main() -> Result<()> {
         });
     }
 
+    let config = Arc::new(load_config(&mut opts, &matches)?);
+
+    let rt_priority = if opts.no_rt {
+        0
+    } else {
+        config.options.rt_priority.unwrap_or(10)
+    };
+    if rt_priority > 0 {
+        set_realtime(rt_priority);
+    }
+
+    // Suspend/resume (and CPU hotplug generally) ejects the scheduler
+    // with a restart action code; re-initialize until told otherwise.
     let mut open_object = MaybeUninit::uninit();
-    let mut sched = Scheduler::init(&opts, &mut open_object)?;
-    let uei = sched.run(shutdown)?;
-    uei.report()?;
-    Ok(())
+    loop {
+        let mut sched = Scheduler::init(&opts, config.clone(), &mut open_object)?;
+        let uei = sched.run(shutdown.clone())?;
+        drop(sched);
+        if shutdown.load(Ordering::Relaxed) || !uei.should_restart() {
+            uei.report()?;
+            return Ok(());
+        }
+        info!("scheduler ejected for restart (hotplug/suspend); re-initializing");
+    }
 }

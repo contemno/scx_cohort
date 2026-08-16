@@ -67,31 +67,59 @@ with EINVAL, rerun with `-vv` to print the libbpf/verifier log.
 Watch it work:
 
 ```sh
-./target/release/scx_cohort --monitor 1     # or scxtop
+scx_cohort top                              # per-cohort/per-process view
+./target/release/scx_cohort --monitor 1     # aggregate metrics (or scxtop)
 ```
 
-The headline number is `affinity` — the percentage of placements that
-landed on the task's home CCD. Regressions show up there before they show
-up in frame times.
+`scx_cohort top` shows each cohort (home CCD, `*` = rule-pinned,
+utilization, affinity) with its member processes beneath (threads, `sN` =
+N threads currently spilled to the other CCD). The headline number is
+**affinity** — the percentage of runtime executed on the home CCD.
+Regressions show up there before they show up in frame times.
 
-## Tuning
+The daemon raises itself to `SCHED_FIFO 10` so it can never be starved by
+the scheduling class it implements (`--no-rt` or `rt_priority = 0` in the
+config opts out). On suspend/resume or CPU hotplug the kernel ejects the
+scheduler with a restart code; the daemon re-initializes automatically
+(logged as "scheduler ejected for restart").
 
-The four numbers that matter (DESIGN.md §6 Phase 6):
+## Command-line options
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--slice-us` | 5000 | Scheduling slice duration in microseconds. |
+| `--interval-ms` | 200 | Daemon tick (balancer/discovery) interval. |
 | `--steal-min` | 2 | Steal across the fabric only when the foreign queue is deeper than this… |
 | `--steal-delay-us` | 500 | …or its head task has waited this long. Higher = stickier CCDs. |
 | `--imbalance-pct` | 20 | Inter-CCD load gap (as % of one CCD) that triggers a cohort move. |
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |
+| `--config <path>` | `/etc/scx_cohort.conf` | Config file. The default path may be absent; an explicit one must exist. |
+| `--no-rt` | off | Don't raise the daemon to SCHED_FIFO. |
+| `--stats <sec>` | — | Print aggregate metrics every interval while scheduling. |
+| `--monitor <sec>` | — | Metrics-only mode against a running scheduler. |
+| `-v` / `-vv` | — | Debug / trace logging (`-vv` includes the libbpf/verifier log). |
+| `top [--interval <sec>]` | 2 | Live per-cohort/per-process view against a running scheduler. |
 
-## Rules file (optional)
+`scx_cohort --help` is authoritative; the table is a convenience copy.
 
-The automatic mechanisms need no configuration; a TOML file layered on
-top handles overrides and experiments (`--config path.toml`):
+## Configuration file
+
+Read from `/etc/scx_cohort.conf` by default (TOML). Both tables are
+optional; unknown keys are rejected so typos fail loudly. Precedence:
+built-in defaults < `[options]` < explicitly passed CLI flags.
 
 ```toml
+[options]
+slice_us = 5000
+interval_ms = 200
+steal_min = 2
+steal_delay_us = 500
+imbalance_pct = 20
+residency_ms = 2000
+merge_wakes_per_sec = 300.0
+rt_priority = 10              # SCHED_FIFO priority; 0 disables
+
 [[rule]]
 match_comm = ["wineserver", "wine64-preloader"]
 join_cohort_of = "parent"     # default anyway; shown for illustration
@@ -105,8 +133,33 @@ match_comm = ["my-benchmark"]
 pin_ccd = 0                   # nail this cohort to CCD 0
 ```
 
-Rules are evaluated in order; the first match wins; criteria within a
-rule AND together.
+`[[rule]]` keys: `match_comm` (list of exact comm names), `match_cgroup`
+(glob against the cgroup v2 path), `pin_ccd` (pin the matching task's
+cohort to a CCD), `min_ccd_residency_ms` (per-cohort balancer hysteresis
+override), `join_cohort_of = "parent"` (documents the default lineage
+behavior). Rules are evaluated in order; the first match wins; criteria
+within a rule AND together.
+
+## Running as a service
+
+```sh
+sudo install -m755 target/release/scx_cohort /usr/local/bin/
+sudo install -m644 systemd/scx_cohort.service /etc/systemd/system/
+sudo install -m644 systemd/journald@scx-cohort.conf /etc/systemd/
+sudo systemctl daemon-reload
+sudo systemctl enable --now scx_cohort
+```
+
+Logs go to a dedicated journald namespace (requires systemd ≥ 245),
+RAM-backed and capped at one hour / 64M so scheduler chatter never
+accumulates in the main journal:
+
+```sh
+journalctl --namespace scx-cohort -u scx_cohort -f
+```
+
+The unit restarts the daemon on failure and also sets the RT scheduling
+class as defense in depth.
 
 ## Development
 

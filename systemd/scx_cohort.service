@@ -1,0 +1,21 @@
+[Unit]
+Description=scx_cohort CCD-affine sched_ext scheduler
+ConditionPathIsDirectory=/sys/kernel/sched_ext
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/scx_cohort
+Restart=on-failure
+RestartSec=1
+# Our logs live in a dedicated RAM-backed journal namespace capped at one
+# hour (see journald@scx-cohort.conf). Read them with:
+#   journalctl --namespace scx-cohort -u scx_cohort -f
+LogNamespace=scx-cohort
+# Defense in depth: the daemon also raises itself to SCHED_FIFO 10.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=10
+
+[Install]
+WantedBy=multi-user.target

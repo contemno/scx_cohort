@@ -245,6 +245,7 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	struct CohortPolicy *policy;
 	u32 pid = p->pid;
 	u32 *spill;
+	u32 home;
 	u64 id;
 
 	if (!tctx)
@@ -254,6 +255,7 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	if (spill) {
 		tctx->is_spilled = 1;
 		tctx->spill_llc = safe_llc(*spill);
+		tctx->home_llc = tctx->spill_llc;
 		return tctx->spill_llc;
 	}
 	tctx->is_spilled = 0;
@@ -261,9 +263,13 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	id = resolve_cohort(p, tctx);
 	policy = bpf_map_lookup_elem(&cohort_policy, &id);
 	if (!policy)
-		return llc_of_cpu(scx_bpf_task_cpu(p));
+		home = llc_of_cpu(scx_bpf_task_cpu(p));
+	else
+		home = safe_llc(policy->home_llc);
 
-	return safe_llc(policy->home_llc);
+	/* Cached for stopping's home-vs-away runtime accounting. */
+	tctx->home_llc = home;
+	return home;
 }
 
 /*
@@ -575,6 +581,8 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 
 		if (ts) {
 			ts->runtime_sum += delta;
+			if (run_llc == tctx->home_llc)
+				ts->runtime_home_sum += delta;
 			/* Keeps the daemon's view current across merges. */
 			ts->cohort_id = tctx->cohort_id;
 		}

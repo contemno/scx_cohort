@@ -28,8 +28,35 @@ use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ConfigFile {
+    #[serde(default)]
+    pub options: OptionsTable,
     #[serde(default, rename = "rule")]
     pub rules: Vec<RuleFile>,
+}
+
+/// `[options]`: daemon knobs mirroring the CLI flags, so a systemd
+/// service can be tuned without editing the unit. Explicitly passed CLI
+/// flags take precedence over these; these take precedence over built-in
+/// defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionsTable {
+    /// Scheduling slice in microseconds.
+    pub slice_us: Option<u64>,
+    /// Daemon tick interval in milliseconds.
+    pub interval_ms: Option<u64>,
+    /// Steal gate: minimum foreign queue depth.
+    pub steal_min: Option<u64>,
+    /// Steal gate: maximum head wait in microseconds.
+    pub steal_delay_us: Option<u64>,
+    /// Balancer imbalance threshold, % of one CCD's capacity.
+    pub imbalance_pct: Option<u64>,
+    /// Post-move cohort immunity in milliseconds.
+    pub residency_ms: Option<u64>,
+    /// Sustained cross-cohort wake rate that merges cohorts.
+    pub merge_wakes_per_sec: Option<f64>,
+    /// SCHED_FIFO priority for the daemon; 0 disables the RT boost.
+    pub rt_priority: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +86,7 @@ pub struct Rule {
 
 #[derive(Debug, Default)]
 pub struct Config {
+    pub options: OptionsTable,
     pub rules: Vec<Rule>,
 }
 
@@ -89,7 +117,10 @@ impl Config {
                 min_ccd_residency_ms: r.min_ccd_residency_ms,
             });
         }
-        Ok(Self { rules })
+        Ok(Self {
+            options: file.options,
+            rules,
+        })
     }
 
     pub fn load(path: &std::path::Path) -> Result<Self> {
@@ -185,6 +216,29 @@ pin_ccd = 1
         assert!(cfg.match_task("game", "user.slice/foo").is_some());
         assert!(cfg.match_task("game", "system.slice/foo").is_none());
         assert!(cfg.match_task("other", "user.slice/foo").is_none());
+    }
+
+    #[test]
+    fn options_table_parses() {
+        let cfg = Config::parse(
+            "[options]\nslice_us = 3000\nrt_priority = 0\n\n[[rule]]\nmatch_comm = [\"a\"]\npin_ccd = 1",
+        )
+        .unwrap();
+        assert_eq!(cfg.options.slice_us, Some(3000));
+        assert_eq!(cfg.options.rt_priority, Some(0));
+        assert!(cfg.options.interval_ms.is_none());
+        assert_eq!(cfg.rules.len(), 1);
+    }
+
+    #[test]
+    fn options_absent_is_fine() {
+        let cfg = Config::parse("[[rule]]\nmatch_comm = [\"a\"]\npin_ccd = 1").unwrap();
+        assert!(cfg.options.slice_us.is_none());
+    }
+
+    #[test]
+    fn unknown_option_key_rejected() {
+        assert!(Config::parse("[options]\nslice_usec = 1").is_err());
     }
 
     #[test]
