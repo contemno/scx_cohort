@@ -1,0 +1,9 @@
+[package]
+name = "scx_cohort_common"
+description = "Shared type and constant definitions for the scx_cohort scheduler: single source of truth consumed by both the userspace daemon (directly) and the BPF component (via a cbindgen-generated header)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }

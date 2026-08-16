@@ -1,0 +1,22 @@
+[package]
+name = "scx_cohort"
+description = "A CCD-affine sched_ext scheduler: discovers groups of related tasks (cohorts), gives each a home CCD, and crosses the Infinity Fabric only when the math clearly favors it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+ctrlc = { version = "3", features = ["termination"] }
+libbpf-rs = "=0.26.2"
+libc = "0.2"
+log = "0.4"
+scx_cohort_common = { path = "../scx_cohort_common" }
+scx_utils = "1.1.2"
+simplelog = "0.12"
+zerocopy = "0.8"
+
+[build-dependencies]
+scx_cargo = "1.1.2"
+cbindgen = "0.29"
