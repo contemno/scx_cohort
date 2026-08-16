@@ -707,26 +707,25 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cohort_init)
 		if (ret)
 			return ret;
 
+		/*
+		 * Build the mask fully on the owned pointer before publishing
+		 * it. This callback is sleepable, so a pointer read back out
+		 * of the map is untrusted (no RCU marking) and the verifier
+		 * rejects mutating kfuncs on it; the create→set→xchg order
+		 * never needs one.
+		 */
 		mask = bpf_cpumask_create();
 		if (!mask)
 			return -ENOMEM;
+		bpf_for(cpu, 0, nr_cpus) {
+			if (cpu >= MAX_CPUS)
+				break;
+			if (safe_llc(cpu_llc_id[cpu]) == llc)
+				bpf_cpumask_set_cpu(cpu, mask);
+		}
 		old = bpf_kptr_xchg(&llcx->cpumask, mask);
 		if (old)
 			bpf_cpumask_release(old);
-	}
-
-	bpf_for(cpu, 0, nr_cpus) {
-		struct llc_ctx *llcx;
-		struct bpf_cpumask *mask;
-
-		if (cpu >= MAX_CPUS)
-			break;
-		llcx = lookup_llc_ctx(safe_llc(cpu_llc_id[cpu]));
-		if (!llcx)
-			continue;
-		mask = llcx->cpumask;
-		if (mask)
-			bpf_cpumask_set_cpu(cpu, mask);
 	}
 
 	/* Per-CPU scratch masks for select_cpu's intersections. */

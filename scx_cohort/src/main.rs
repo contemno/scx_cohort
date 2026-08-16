@@ -191,6 +191,14 @@ struct Scheduler<'a> {
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+        if unsafe { libc::geteuid() } != 0 {
+            bail!(
+                "scx_cohort must run as root to load its BPF scheduler \
+                 (try: sudo scx_cohort). Loading sched_ext programs requires \
+                 CAP_BPF and CAP_SYS_ADMIN."
+            );
+        }
+
         let topo = Topology::new().context("failed to discover topology")?;
         log_topology(&topo);
         if topo.nodes.len() > 1 {
@@ -250,7 +258,8 @@ impl<'a> Scheduler<'a> {
             .map(|llc| (llc.id as u32, llc.all_cpus.len() as u64))
             .collect();
 
-        let mut skel = scx_ops_load!(skel, cohort_ops, uei)?;
+        let mut skel = scx_ops_load!(skel, cohort_ops, uei)
+            .context("BPF load failed — rerun with -vv to print the libbpf/verifier log")?;
         let struct_ops = scx_ops_attach!(skel, cohort_ops)?;
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
         info!("scx_cohort attached");
