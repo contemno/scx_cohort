@@ -117,6 +117,18 @@ struct {
 	__uint(max_entries, NR_STATS);
 } stats SEC(".maps");
 
+/*
+ * pid → TaskStat. Task storage cannot be iterated from userspace, so the
+ * daemon's per-tick view of tasks (duty cycles, spill candidates, comm
+ * rule matching) lives in this ordinary hash instead.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, struct TaskStat);
+	__uint(max_entries, 65536);
+} task_stats SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt = bpf_map_lookup_elem(&stats, &idx);
@@ -395,6 +407,17 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 	if (cohort)
 		__sync_fetch_and_add(&cohort->load_sum,
 				     delta * p->scx.weight / 100);
+
+	{
+		u32 pid = p->pid;
+		struct TaskStat *ts = bpf_map_lookup_elem(&task_stats, &pid);
+
+		if (ts) {
+			ts->runtime_sum += delta;
+			/* Keeps the daemon's view current across merges. */
+			ts->cohort_id = tctx->cohort_id;
+		}
+	}
 }
 
 /*
@@ -456,6 +479,17 @@ s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 		tctx->vtime = llcx ? llcx->vtime_now : 0;
 	}
 
+	{
+		u32 pid = p->pid;
+		struct TaskStat ts = {
+			.tgid = p->tgid,
+			.cohort_id = id,
+		};
+
+		__builtin_memcpy(ts.comm, p->comm, sizeof(ts.comm));
+		bpf_map_update_elem(&task_stats, &pid, &ts, BPF_ANY);
+	}
+
 	return 0;
 }
 
@@ -471,6 +505,12 @@ void BPF_STRUCT_OPS(cohort_exit_task, struct task_struct *p,
 	cohort = bpf_map_lookup_elem(&cohorts, &tctx->cohort_id);
 	if (cohort)
 		__sync_fetch_and_sub(&cohort->nr_tasks, 1);
+
+	{
+		u32 pid = p->pid;
+
+		bpf_map_delete_elem(&task_stats, &pid);
+	}
 	/*
 	 * Empty cohorts and stale tgid_cohort entries are garbage-collected
 	 * by the daemon, which can iterate the maps; BPF cannot.
