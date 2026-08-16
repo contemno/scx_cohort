@@ -161,6 +161,24 @@ journalctl --namespace scx-cohort -u scx_cohort -f
 The unit restarts the daemon on failure and also sets the RT scheduling
 class as defense in depth.
 
+## Benchmarking
+
+`bench/` holds an A/B harness for proving (or disproving) the design
+against the default scheduler on real hardware:
+
+```sh
+cargo build --release
+sudo bench/run-suite.sh          # interleaved eevdf-vs-cohort rounds
+python3 bench/analyze.py bench/results/<timestamp>/results.csv
+```
+
+It runs a cache-line-bouncing IPC microbenchmark modeled on the Chrome/
+Wine failure mode plus schbench/hackbench, records migration counts and
+the scheduler's achieved affinity per run, and the analyzer reports
+median deltas with Mann-Whitney significance tests. Game (MangoHud) and
+Chrome (Speedometer) measurement flows, and the full methodology
+checklist, are in [bench/README.md](bench/README.md).
+
 ## Development
 
 ```sh
