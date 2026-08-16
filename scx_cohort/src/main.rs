@@ -26,6 +26,8 @@ use scx_utils::uei_report;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 
+use scx_cohort_common::{Tunables, MAX_CPUS, MAX_LLCS};
+
 /// scx_cohort: A CCD-affine sched_ext scheduler.
 ///
 /// Discovers groups of related tasks ("cohorts"), gives each cohort a home
@@ -42,9 +44,28 @@ struct Opts {
     #[clap(long, default_value = "200")]
     interval_ms: u64,
 
+    /// Steal from a foreign CCD only when its queue holds more than this
+    /// many tasks...
+    #[clap(long, default_value = "2")]
+    steal_min: u64,
+
+    /// ...or its head task has waited longer than this many microseconds.
+    #[clap(long, default_value = "500")]
+    steal_delay_us: u64,
+
     /// Increase verbosity (-v: debug, -vv: trace).
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
+}
+
+impl Opts {
+    fn tunables(&self) -> Tunables {
+        Tunables {
+            steal_min: self.steal_min,
+            steal_delay_ns: self.steal_delay_us * 1000,
+            ..Tunables::default()
+        }
+    }
 }
 
 fn log_topology(topo: &Topology) {
@@ -94,7 +115,43 @@ impl<'a> Scheduler<'a> {
         let open_opts: Option<libbpf_rs::libbpf_sys::bpf_object_open_opts> = None;
         let mut skel = scx_ops_open!(skel_builder, open_object, cohort_ops, open_opts)?;
 
-        skel.maps.rodata_data.as_mut().unwrap().slice_ns = opts.slice_us * 1000;
+        if topo.all_llcs.len() > MAX_LLCS as usize {
+            bail!(
+                "{} LLCs exceeds MAX_LLCS ({})",
+                topo.all_llcs.len(),
+                MAX_LLCS
+            );
+        }
+        if topo.all_llcs.len() < 2 {
+            info!("single LLC detected; cohort placement degrades to plain vtime scheduling");
+        }
+
+        {
+            let rodata = skel.maps.rodata_data.as_mut().unwrap();
+            rodata.slice_ns = opts.slice_us * 1000;
+            rodata.nr_llcs = topo.all_llcs.len() as u32;
+            rodata.nr_cpus = *topo.all_cpus.keys().max().unwrap_or(&0) as u32 + 1;
+            if rodata.nr_cpus > MAX_CPUS {
+                bail!("CPU id range {} exceeds MAX_CPUS ({})", rodata.nr_cpus, MAX_CPUS);
+            }
+            for cpu in topo.all_cpus.values() {
+                rodata.cpu_llc_id[cpu.id] = cpu.llc_id as u32;
+            }
+        }
+
+        {
+            // The skeleton's Tunables type is generated from BPF BTF, which
+            // itself came from the shared crate via intf.h; field-by-field
+            // assignment keeps the compiler checking that round trip.
+            let t = opts.tunables();
+            let data = skel.maps.data_data.as_mut().unwrap();
+            data.tunables.steal_min = t.steal_min;
+            data.tunables.steal_delay_ns = t.steal_delay_ns;
+            data.tunables.credit_max_ns = t.credit_max_ns;
+            data.tunables.credit_wake_freq_min = t.credit_wake_freq_min;
+            data.tunables.credit_runtime_max_ns = t.credit_runtime_max_ns;
+            data.tunables.sample_shift = t.sample_shift;
+        }
 
         let mut skel = scx_ops_load!(skel, cohort_ops, uei)?;
         let struct_ops = scx_ops_attach!(skel, cohort_ops)?;
