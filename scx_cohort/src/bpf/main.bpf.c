@@ -72,9 +72,10 @@ struct {
 	__uint(max_entries, MAX_LLCS);
 } llcs SEC(".maps");
 
-/* Per-CPU scratch cpumask for computing intersections in select_cpu. */
+/* Per-CPU scratch state: cpumask for intersections, wake-edge sampling. */
 struct scratch_ctx {
 	struct bpf_cpumask __kptr *mask;
+	u32 sample_ctr;
 };
 
 struct {
@@ -129,6 +130,19 @@ struct {
 	__uint(max_entries, 65536);
 } task_stats SEC(".maps");
 
+/*
+ * (waker_tgid, wakee_tgid) → sampled wake count. The daemon reads and
+ * decays these to discover relationships lineage misses (merges) and to
+ * see a cohort's internal structure (splits). LRU: cold edges fall out on
+ * their own.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, struct WakeEdgeKey);
+	__type(value, u64);
+	__uint(max_entries, WAKE_EDGE_SLOTS);
+} wake_edges SEC(".maps");
+
 static void stat_inc(u32 idx)
 {
 	u64 *cnt = bpf_map_lookup_elem(&stats, &idx);
@@ -164,6 +178,24 @@ static u32 llc_of_cpu(s32 cpu)
 }
 
 /*
+ * Resolve @p's cohort through tgid_cohort — the map the daemon rewrites
+ * to apply merges and splits — refreshing the task-storage cache, so
+ * membership changes take effect on the very next wakeup.
+ */
+static u64 resolve_cohort(struct task_struct *p, struct TaskCtx *tctx)
+{
+	u32 tgid = p->tgid;
+	u64 *idp = bpf_map_lookup_elem(&tgid_cohort, &tgid);
+
+	if (idp) {
+		if (tctx)
+			tctx->cohort_id = *idp;
+		return *idp;
+	}
+	return tctx ? tctx->cohort_id : COHORT_INVALID;
+}
+
+/*
  * The LLC this task should be placed on: its cohort's home, or the spill
  * target if the daemon marked it spilled.
  */
@@ -171,6 +203,7 @@ static u32 task_home_llc(struct task_struct *p)
 {
 	struct TaskCtx *tctx = lookup_task_ctx(p);
 	struct CohortCtx *cohort;
+	u64 id;
 
 	if (!tctx)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
@@ -178,11 +211,48 @@ static u32 task_home_llc(struct task_struct *p)
 	if (tctx->is_spilled)
 		return safe_llc(tctx->spill_llc);
 
-	cohort = bpf_map_lookup_elem(&cohorts, &tctx->cohort_id);
+	id = resolve_cohort(p, tctx);
+	cohort = bpf_map_lookup_elem(&cohorts, &id);
 	if (!cohort)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
 
 	return safe_llc(cohort->home_llc);
+}
+
+/*
+ * Sampled recording of one waker→wakee edge. Cost is one LRU hash update
+ * every 2^sample_shift cross-process wakeups per CPU.
+ */
+static void record_wake_edge(struct task_struct *p)
+{
+	struct task_struct *waker = (void *)bpf_get_current_task_btf();
+	struct scratch_ctx *sctx;
+	const u32 zero = 0;
+
+	if (!waker || waker->tgid == p->tgid)
+		return;
+
+	sctx = bpf_map_lookup_elem(&scratch_stor, &zero);
+	if (!sctx)
+		return;
+	if (++sctx->sample_ctr & ((1 << (tunables.sample_shift & 15)) - 1))
+		return;
+
+	{
+		struct WakeEdgeKey key = {
+			.waker_tgid = waker->tgid,
+			.wakee_tgid = p->tgid,
+		};
+		u64 *cnt = bpf_map_lookup_elem(&wake_edges, &key);
+
+		if (cnt) {
+			__sync_fetch_and_add(cnt, 1);
+		} else {
+			u64 one = 1;
+
+			bpf_map_update_elem(&wake_edges, &key, &one, BPF_ANY);
+		}
+	}
 }
 
 /*
@@ -216,6 +286,8 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	bool prev_in_home;
 	u32 home;
 	s32 cpu;
+
+	record_wake_edge(p);
 
 	if (p->nr_cpus_allowed == 1)
 		return prev_cpu;
@@ -498,11 +570,17 @@ void BPF_STRUCT_OPS(cohort_exit_task, struct task_struct *p,
 {
 	struct TaskCtx *tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
 	struct CohortCtx *cohort;
+	u64 id;
 
 	if (!tctx)
 		return;
 
-	cohort = bpf_map_lookup_elem(&cohorts, &tctx->cohort_id);
+	/*
+	 * Resolve through tgid_cohort so that after a daemon-applied merge
+	 * the decrement lands on the cohort that absorbed our count.
+	 */
+	id = resolve_cohort(p, tctx);
+	cohort = bpf_map_lookup_elem(&cohorts, &id);
 	if (cohort)
 		__sync_fetch_and_sub(&cohort->nr_tasks, 1);
 

@@ -62,6 +62,10 @@ pub struct Metrics {
 
     #[stat(desc = "cohort home moves by the load balancer")]
     pub nr_migrations: u64,
+    #[stat(desc = "cohort merges from wake-edge discovery")]
+    pub nr_merges: u64,
+    #[stat(desc = "cohort splits from wake-edge discovery")]
+    pub nr_splits: u64,
     #[stat(desc = "per-LLC statistics")]
     pub llcs: BTreeMap<usize, LlcMetrics>,
 }
@@ -70,8 +74,13 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={}",
-            self.nr_cohorts, self.nr_tasks, self.affinity_hit_pct, self.nr_migrations,
+            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={}",
+            self.nr_cohorts,
+            self.nr_tasks,
+            self.affinity_hit_pct,
+            self.nr_migrations,
+            self.nr_merges,
+            self.nr_splits,
         )?;
         writeln!(
             w,
@@ -110,6 +119,8 @@ impl Metrics {
             nr_steals: self.nr_steals - rhs.nr_steals,
             nr_tctx_errors: self.nr_tctx_errors - rhs.nr_tctx_errors,
             nr_migrations: self.nr_migrations - rhs.nr_migrations,
+            nr_merges: self.nr_merges - rhs.nr_merges,
+            nr_splits: self.nr_splits - rhs.nr_splits,
             ..self.clone()
         }
     }
