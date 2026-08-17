@@ -1,0 +1,118 @@
+name: Build & Release
+
+# Reusable workflow: build the artifact for a given ref, then publish a GitHub
+# release with it attached. This is the ONE build definition — called by both:
+#   * release.yml  — when a v* tag is pushed by a human (manual path)
+#   * autotag.yml  — after it auto-creates a tag on push to dev/main
+# Factoring it out means the manual and automated paths can never produce
+# different outputs. See repo_standard's STANDARD.md → "One build definition".
+#
+# The release is created as a DRAFT with the asset attached, then flipped to
+# published — required when a repo uses immutable releases (assets attach only
+# while a draft).
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (tag) to build and release.
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease.
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0  # full history + tags (e.g. for changelog generation)
+
+      - name: Install BPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libelf-dev zlib1g-dev
+
+      # Build the scheduler daemon (which embeds the compiled BPF skeleton via
+      # build.rs) and package it with the systemd units. The bench workspace
+      # member is dev tooling, not a shipped artifact.
+      - name: Build artifact
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          rustup update stable && rustup default stable
+          cargo build --release -p scx_cohort
+          stage="scx_cohort-${REF}-x86_64-linux-gnu"
+          mkdir -p "artifacts" "${stage}/systemd"
+          cp target/release/scx_cohort "${stage}/"
+          cp systemd/scx_cohort.service systemd/journald@scx-cohort.conf "${stage}/systemd/"
+          cp README.md "${stage}/"
+          tar -czf "artifacts/${stage}.tar.gz" "${stage}"
+          (cd artifacts && sha256sum -- *.tar.gz > SHA256SUMS)
+
+      # OPTIONAL: prove what actually came out of this build, not just what went
+      # in. Pinning/hashing inputs (see STANDARD.md -> "Supply chain") says
+      # nothing about the output artifact itself. Uncomment and pin if the
+      # published tarball becomes something consumers install directly.
+      # - name: Generate SBOM
+      #   uses: anchore/sbom-action@<SHA>  # vX.Y.Z — pin before enabling
+      #   with:
+      #     path: artifacts/
+      #     format: cyclonedx-json
+      #     output-file: artifacts/sbom.cdx.json
+      # - name: Sign artifacts (keyless)
+      #   uses: sigstore/cosign-installer@<SHA>  # vX.Y.Z — pin before enabling
+      # - run: |
+      #     for f in artifacts/*; do cosign sign-blob --yes --bundle "$f.cosign.bundle" "$f"; done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: build-artifacts
+          path: artifacts/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # least privilege: only this job publishes
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Immutable releases accept assets only while a draft: create the draft WITH
+      # assets, then flip it to published in the next step.
+      - name: Create draft release with assets
+        id: draft_release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        with:
+          tag_name: ${{ inputs.ref }}
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          draft: true
+
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${{ steps.draft_release.outputs.id }}" \
+            -F draft=false --jq .html_url
+
+      # OPTIONAL: pairs with the SBOM/signing steps in the `build` job above —
+      # attests that THIS repo's CI produced these artifacts.
+      # - name: Attest build provenance
+      #   uses: actions/attest-build-provenance@<SHA>  # vX.Y.Z — pin before enabling
+      #   with:
+      #     subject-path: artifacts/*

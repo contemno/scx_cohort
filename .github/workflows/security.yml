@@ -1,0 +1,85 @@
+name: Security
+
+# Scheduled security scanning, separate from Dependabot: Dependabot only proposes
+# an update when a NEW upstream release exists. It says nothing about an advisory
+# disclosed against a version you've already shipped (no fix released yet), and
+# nothing about leaked secrets or code-level findings. This workflow covers that
+# gap. See repo_standard's STANDARD.md -> "Supply chain".
+#
+# Intentionally NOT a required check: daily advisory-DB churn shouldn't block a
+# PR unrelated to the flagged dependency. A finding turns the job red for
+# visibility without wedging merges.
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # weekly, Monday 06:00 UTC
+  pull_request:
+    # Only rerun on PRs that can change what's installed. The only lockfile in
+    # this repo is the Cargo workspace's (bench/analyze.py is stdlib-only).
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # Advisory scan of the CURRENTLY COMMITTED lockfile (the whole Cargo
+  # workspace: daemon, common crate, bench member).
+  advisory-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Run cargo audit against Cargo.lock
+        run: |
+          rustup update stable && rustup default stable
+          cargo install cargo-audit --locked
+          cargo audit
+
+  # The language-agnostic trio from the standard — gitleaks (secret scanning),
+  # CodeQL (SAST), and a Trivy filesystem scan — is deliberately commented out
+  # rather than shipped with unverifiable pins: the standard requires every
+  # third-party `uses:` pinned to a full commit SHA, and those SHAs could not
+  # be resolved/verified from the environment this adoption PR was authored in.
+  # To enable each job: look up the action's current release commit SHA,
+  # replace <SHA>, and uncomment. Leave this workflow non-required either way.
+  #
+  # secret-scan:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #       with:
+  #         fetch-depth: 0  # gitleaks needs history, not just the working tree
+  #     - uses: gitleaks/gitleaks-action@<SHA>  # vX.Y.Z — pin before enabling
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #
+  # codeql:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     security-events: write  # required to upload SARIF to the Security tab
+  #   steps:
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #     - uses: github/codeql-action/init@<SHA>  # vX.Y.Z — pin before enabling
+  #       with:
+  #         languages: rust, c-cpp
+  #         queries: security-and-quality
+  #     - uses: github/codeql-action/analyze@<SHA>  # vX.Y.Z — pin before enabling
+  #
+  # trivy-fs:
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: read
+  #     security-events: write
+  #   steps:
+  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #     - uses: aquasecurity/trivy-action@<SHA>  # vX.Y.Z — pin before enabling
+  #       with:
+  #         scan-type: fs
+  #         format: sarif
+  #         output: trivy-results.sarif
+  #         severity: CRITICAL,HIGH
+  #     - uses: github/codeql-action/upload-sarif@<SHA>  # vX.Y.Z, same pin as codeql job
+  #       with:
+  #         sarif_file: trivy-results.sarif

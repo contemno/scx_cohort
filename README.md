@@ -212,9 +212,14 @@ checklist, are in [bench/README.md](bench/README.md).
 ## Development
 
 ```sh
-cargo test              # policy unit tests + shared-layout assertions
-cargo clippy --all-targets
+make test               # policy unit tests + shared-layout assertions
+make lint               # rustfmt + clippy -D warnings + script syntax
+./scripts/install-hooks.sh   # once: fast pre-push lint hook
 ```
+
+Contribution flow (branches, PRs, releases, project invariants) is in
+[CONTRIBUTING.md](CONTRIBUTING.md); vulnerabilities go through
+[SECURITY.md](SECURITY.md), never public issues.
 
 The BPF program compiles against the header bundle shipped by the
 `scx_cargo` crate (vmlinux.h, `compat.bpf.h` shims for the 6.13 kfunc

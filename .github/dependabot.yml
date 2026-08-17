@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # GitHub Actions: pinned to commit SHAs in workflow files. Dependabot rewrites
+  # the SHA and updates the trailing version comment in lockstep.
+  - package-ecosystem: github-actions
+    directory: /
+    # Open update PRs against dev: merges to main auto-publish a release, so
+    # dependency bumps flow through dev like everything else.
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]   # one grouped PR, not one per action
+    # Let a freshly published (possibly compromised) action release age before
+    # Dependabot proposes adopting it. This only delays routine version bumps —
+    # Dependabot security-advisory PRs bypass cooldown automatically. See
+    # repo_standard's STANDARD.md -> "Supply chain".
+    cooldown:
+      default-days: 14
+
+  # Rust: the one package ecosystem in this repo (Cargo workspace with
+  # Cargo.lock committed; bench/analyze.py is stdlib-only, so no pip block).
+  # This crate loads BPF programs into the kernel, so treat it as
+  # security-sensitive: short patch/minor cooldown so fixes still land
+  # quickly, longer for majors to prove out.
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    cooldown:
+      default-days: 14
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
