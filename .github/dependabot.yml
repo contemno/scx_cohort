@@ -1,0 +1,24 @@
+version: 2
+updates:
+  # GitHub Actions: pinned to commit SHAs in workflow files. Dependabot rewrites
+  # the SHA and updates the trailing version comment in lockstep.
+  - package-ecosystem: github-actions
+    directory: /
+    # Open update PRs against dev: merges to main auto-publish a release, so
+    # dependency bumps flow through dev like everything else.
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]   # one grouped PR, not one per action
+
+  # Rust workspace (Cargo.lock committed at the root).
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]

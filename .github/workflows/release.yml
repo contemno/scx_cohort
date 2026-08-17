@@ -1,0 +1,22 @@
+name: Release
+
+# Manual release path: a human (or the GitHub UI) pushes a v* tag, and this
+# builds + publishes the release. The automated dev/main tagging lives in
+# autotag.yml; both share the build-release.yml reusable workflow so they build
+# identically.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ github.ref_name }}
+      # A plain vX.Y.Z tag is a release; any suffix (e.g. -dev.…) is a prerelease.
+      prerelease: ${{ contains(github.ref_name, '-') }}

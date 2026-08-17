@@ -166,7 +166,12 @@ class as defense in depth.
 ```sh
 cargo test              # policy unit tests + shared-layout assertions
 cargo clippy --all-targets
+./scripts/install-hooks.sh   # one-time: fast cargo-fmt pre-push hook
 ```
+
+Branching, the `feature → dev → main` promotion flow, and the release
+pipeline (auto-tagged from `dev`/`main`, version floor in `VERSION`) are
+described in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 The BPF program compiles against the header bundle shipped by the
 `scx_cargo` crate (vmlinux.h, `compat.bpf.h` shims for the 6.13 kfunc
