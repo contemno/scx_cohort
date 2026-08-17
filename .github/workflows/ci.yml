@@ -1,0 +1,115 @@
+name: CI
+
+# ── Repo-standard CI ─────────────────────────────────────────────────────────
+# Classify the diff ONCE, then gate each area's jobs with `if:` so unrelated
+# jobs SKIP. Required checks must stay reachable: a check that never reports
+# wedges the PR ("waiting for status"); a SKIPPED required job satisfies branch
+# protection. So we never use `paths-ignore` on required jobs — we skip via `if:`.
+#
+# Promotion flow: feature -> dev -> main. Gate PRs into BOTH dev and main.
+#
+# Required check for branch protection: `rust` (the aggregator below) — never
+# the individual rust-lint / rust-test jobs, so the fan-out can be reshaped
+# without touching branch-protection settings.
+on:
+  pull_request:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+# Cancel superseded runs for the same PR when new commits are pushed.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Classify changed paths -> one boolean output per area. Anything unrecognized
+  # (build infra, CI itself) flips every area on, so a misclassified change fails
+  # safe toward running MORE, not less.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # need the base commit to diff against
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          files="$(git diff --name-only "${BASE}"...HEAD)"
+          echo "Changed files:"; echo "${files:-<none>}"
+          rust=false other=false
+          # Empty diff -> treat as infra change and run everything.
+          [ -z "$files" ] && other=true
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|LICENSE) ;;                 # docs -> ignore
+              systemd/*) ;;                    # unit files: no CI gate validates them
+              scx_cohort/*|scx_cohort_common/*|Cargo.toml|Cargo.lock) rust=true ;;
+              *) other=true ;;                 # infra -> run everything
+            esac
+          done <<< "$files"
+          $other && rust=true
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust (other=$other)"
+
+  # ── The `rust` required check FANS OUT into lint + test + an aggregator ─────
+  # Protect the `rust` aggregator name (below), NOT rust-lint / rust-test.
+  # Both fan-out jobs need the full build environment: build.rs compiles the
+  # vendored libbpf and the BPF program (clang) even for clippy and tests.
+  rust-lint:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install BPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libelf-dev zlib1g-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      # ONE warm cache shared across the fan-out (both jobs build the same
+      # debug-profile deps from the same lockfile). The release build uses its
+      # own key in build-release.yml so the profiles don't thrash each other.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: ci-debug
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  rust-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install BPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libelf-dev zlib1g-dev
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: ci-debug
+      # Policy unit tests + shared-layout assertions. Loading the scheduler
+      # needs a sched_ext kernel; building and testing the policy code doesn't.
+      - run: cargo test --locked
+
+  # Aggregator: the single required `rust` check. `if: always()` makes it run
+  # even when an upstream job fails, so it FAILS the check — a plain `needs` job
+  # would be reported "skipped", which branch protection treats as PASSING.
+  rust:
+    needs: [changes, rust-lint, rust-test]
+    if: always() && needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require rust-lint and rust-test to pass
+        run: |
+          echo "lint=${{ needs.rust-lint.result }} test=${{ needs.rust-test.result }}"
+          [ "${{ needs.rust-lint.result }}" = "success" ] || exit 1
+          [ "${{ needs.rust-test.result }}" = "success" ] || exit 1

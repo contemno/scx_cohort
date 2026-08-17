@@ -1,0 +1,25 @@
+name: 📖 Documentation
+description: Something in the docs, README, or help text is wrong or missing
+labels: ["documentation", "triage"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Where?
+      description: File and section, or a URL.
+      placeholder: "e.g. README.md → Installation, or the wiki Getting-Started page"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested fix
+      description: Optional — a proposed wording or the correct command/steps.

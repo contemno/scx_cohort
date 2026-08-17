@@ -1,0 +1,56 @@
+name: ✨ Feature request
+description: Suggest a new capability or improvement
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Check the roadmap/milestones first in case it's
+        already planned.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't already proposed
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's getting in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should it do? Sketch the UX or workflow if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, or other approaches you weighed.
+
+  # Surface the project's core guarantees at the moment work is proposed.
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Project invariants
+      description: Does this proposal respect the guarantees this project must not break?
+      options:
+        - label: >-
+            This preserves the fallback guarantee — daemon exit, crash, or the
+            sched_ext watchdog always detaches the scheduler back to EEVDF, and
+            no per-wakeup BPF path blocks or starves a runnable task — or I've
+            noted how it affects it.
+        - label: >-
+            Any BPF↔userspace shared struct/constant it touches is changed in
+            `scx_cohort_common` only (both sides + the layout tests move
+            together; `intf.h` is generated, never hand-edited).

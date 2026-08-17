@@ -1,0 +1,93 @@
+name: Auto-tag
+
+# Automatically tag (and release) on every push/merge to a tracked branch:
+#   * dev  -> prerelease tag  vX.Y.Z-dev.<UTC-date>.<short-sha>, GitHub prerelease
+#   * main -> release tag     vX.Y.Z (next version per scripts/next-version.sh)
+#
+# The next version is max(patch-bump of the latest vX.Y.Z release tag, ./VERSION
+# floor), so bumping ./VERSION cuts exactly one minor/major and patch releases
+# resume afterward.
+#
+# GOTCHA: a tag pushed with the default GITHUB_TOKEN does NOT trigger
+# release.yml's `on: push: tags` (GitHub suppresses it to avoid loops), so this
+# workflow drives the build itself by calling build-release.yml — keeping the
+# whole flow in one run with no PAT/App token and no double builds.
+on:
+  push:
+    branches: [dev, main]
+    # Don't cut a tag/release for pushes that can't change the shipped artifact
+    # or its runtime behavior. paths-ignore is all-or-nothing: any of these
+    # bundled with real code still releases normally.
+    # Deliberately NOT ignored: Cargo.toml/Cargo.lock and the crates (they build
+    # the binary), systemd/ (units ship in the release tarball), and ./VERSION
+    # (the floor — a lone version bump must still cut the release).
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'scripts/**'
+
+permissions:
+  contents: write
+
+# Serialize releases per branch so two quick pushes don't race to tag/build.
+# Never cancel in-progress: aborting a half-done tag/release is worse than
+# letting it finish.
+concurrency:
+  group: autotag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      prerelease: ${{ steps.compute.outputs.prerelease }}
+      created: ${{ steps.create.outputs.created }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0  # need all tags to find the latest release
+
+      - name: Compute next version and tag
+        id: compute
+        run: |
+          set -euo pipefail
+          next="$(./scripts/next-version.sh)"
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            tag="v${next}"
+            prerelease=false
+          else
+            tag="v${next}-dev.$(date -u +%Y%m%d).$(git rev-parse --short HEAD)"
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Branch ${GITHUB_REF_NAME}: next=${next} -> tag=${tag} (prerelease=${prerelease})"
+
+      - name: Create and push tag
+        id: create
+        env:
+          TAG: ${{ steps.compute.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin; skipping."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      ref: ${{ needs.tag.outputs.tag }}
+      prerelease: ${{ needs.tag.outputs.prerelease == 'true' }}

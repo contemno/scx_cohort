@@ -1,0 +1,101 @@
+name: Build & Release
+
+# Reusable workflow: build the artifact for a given ref, then publish a GitHub
+# release with it attached. This is the ONE build definition — called by both:
+#   * release.yml  — when a v* tag is pushed by a human (manual path)
+#   * autotag.yml  — after it auto-creates a tag on push to dev/main
+# Factoring it out means the manual and automated paths can never produce
+# different outputs.
+#
+# The release is created as a DRAFT with the asset attached, then flipped to
+# published — required when a repo uses immutable releases (assets attach only
+# while a draft).
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref (tag) to build and release.
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease.
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0  # full history + tags (e.g. for changelog generation)
+
+      - name: Install BPF build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang libelf-dev zlib1g-dev
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      # Distinct key from CI's debug cache: release-profile artifacts would
+      # thrash a shared debug key. cargo never runs `clean`, so nothing here
+      # can wipe the restored cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: release
+
+      - name: Build artifact
+        env:
+          TAG: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked
+          stage="scx_cohort-${TAG}-x86_64-linux-gnu"
+          mkdir -p "artifacts" "${stage}/systemd"
+          install -m755 target/release/scx_cohort "${stage}/"
+          install -m644 systemd/scx_cohort.service systemd/journald@scx-cohort.conf "${stage}/systemd/"
+          install -m644 README.md DESIGN.md "${stage}/"
+          tar czf "artifacts/${stage}.tar.gz" "${stage}"
+          (cd artifacts && sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+          ls -l artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: build-artifacts
+          path: artifacts/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # least privilege: only this job publishes
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Immutable releases accept assets only while a draft: create the draft WITH
+      # assets, then flip it to published in the next step.
+      - name: Create draft release with assets
+        id: draft_release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe  # v2.6.1
+        with:
+          tag_name: ${{ inputs.ref }}
+          files: artifacts/scx_cohort-*
+          generate_release_notes: true
+          prerelease: ${{ inputs.prerelease }}
+          draft: true
+
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${{ steps.draft_release.outputs.id }}" \
+            -F draft=false --jq .html_url
