@@ -3,3 +3,5 @@
 /scx_cohort/src/bpf/intf.h
 # Benchmark harness output (see bench/README.md)
 /bench/results/
+# Bytecode from `make lint-scripts` (python3 -m py_compile)
+__pycache__/
