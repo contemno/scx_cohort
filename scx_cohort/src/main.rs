@@ -26,6 +26,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Set by the signal handler on SIGINT/SIGTERM. A plain static (not a
+/// thread, unlike the ctrlc crate) so the process stays single-threaded
+/// until after the optional capability drop — capabilities are per-thread
+/// on Linux, and a thread spawned before the drop would keep its own.
+pub(crate) static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+fn install_signal_handlers() -> Result<()> {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
+                bail!(
+                    "failed to install handler for signal {sig}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
@@ -120,6 +147,13 @@ struct Opts {
     #[clap(long)]
     no_rt: bool,
 
+    /// Drop ALL capabilities once the scheduler is attached. Suspend and
+    /// CPU hotplug then end the process (instead of re-initializing in
+    /// place), relying on the service manager to restart it — run under
+    /// systemd with Restart=on-failure when enabling this.
+    #[clap(long)]
+    drop_privs: bool,
+
     /// Increase verbosity (-v: debug, -vv: trace).
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -213,7 +247,6 @@ struct Scheduler<'a> {
     nr_splits: u64,
     /// Last tick's task snapshot, for the procs (top) view.
     last_tasks: Vec<TaskSnapshot>,
-    stats_server: StatsServer<stats::StatsReq, stats::StatsRes>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -292,7 +325,6 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, cohort_ops, uei)
             .context("BPF load failed — rerun with -vv to print the libbpf/verifier log")?;
         let struct_ops = scx_ops_attach!(skel, cohort_ops)?;
-        let stats_server = StatsServer::new(stats::server_data()).launch()?;
         info!("scx_cohort attached");
 
         Ok(Self {
@@ -329,7 +361,6 @@ impl<'a> Scheduler<'a> {
             nr_merges: 0,
             nr_splits: 0,
             last_tasks: Vec::new(),
-            stats_server,
         })
     }
 
@@ -869,12 +900,15 @@ impl<'a> Scheduler<'a> {
         Ok((cohorts, llcs))
     }
 
-    fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
-        let (res_ch, req_ch) = self.stats_server.channels();
+    fn run(
+        &mut self,
+        stats_server: &StatsServer<stats::StatsReq, stats::StatsRes>,
+    ) -> Result<UserExitInfo> {
+        let (res_ch, req_ch) = stats_server.channels();
         let mut next_tick = Instant::now() + self.interval;
         let mut last_view = (Vec::new(), Vec::new());
 
-        while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
+        while !SHUTDOWN.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             let timeout = next_tick.saturating_duration_since(Instant::now());
             match req_ch.recv_timeout(timeout) {
                 Ok(stats::StatsReq::Metrics) => {
@@ -902,6 +936,58 @@ impl<'a> Scheduler<'a> {
         }
         uei_report!(&self.skel, uei)
     }
+}
+
+/// Irrevocably drop every capability: ambient, bounding, and the
+/// effective/permitted/inheritable sets, plus no_new_privs. The daemon
+/// stays uid 0 but can no longer load BPF, raise priorities, load
+/// modules, or regain anything via execve. Map fds already held keep
+/// working — steady-state operation needs no capabilities at all.
+fn drop_all_capabilities() -> Result<()> {
+    unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64);
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL as u64,
+            0u64,
+            0u64,
+            0u64,
+        );
+        // Highest capability number varies by kernel; over-dropping just
+        // returns EINVAL, which is fine.
+        for cap in 0..=63u64 {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap, 0u64, 0u64, 0u64);
+        }
+    }
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData::default(), CapData::default()];
+    let ret = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
+    if ret != 0 {
+        bail!(
+            "capset failed: {} (refusing to run half-dropped)",
+            std::io::Error::last_os_error()
+        );
+    }
+    info!("all capabilities dropped");
+    Ok(())
 }
 
 /// Raise the daemon to SCHED_FIFO so it can never be starved by the
@@ -995,26 +1081,14 @@ fn main() -> Result<()> {
         },
     )?;
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::Relaxed);
-    })
-    .context("error setting Ctrl-C handler")?;
+    install_signal_handlers()?;
 
     if let Some(Command::Top { interval }) = &opts.command {
-        return top::run(Duration::from_secs_f64(*interval), shutdown);
+        return top::run(Duration::from_secs_f64(*interval));
     }
 
     if let Some(intv) = opts.monitor {
-        return stats::monitor(Duration::from_secs_f64(intv), shutdown);
-    }
-
-    if let Some(intv) = opts.stats {
-        let shutdown_copy = shutdown.clone();
-        std::thread::spawn(move || {
-            let _ = stats::monitor(Duration::from_secs_f64(intv), shutdown_copy);
-        });
+        return stats::monitor(Duration::from_secs_f64(intv));
     }
 
     let config = Arc::new(load_config(&mut opts, &matches)?);
@@ -1028,17 +1102,68 @@ fn main() -> Result<()> {
         set_realtime(rt_priority);
     }
 
+    let drop_privs = opts.drop_privs || config.options.drop_privs.unwrap_or(false);
+
     // Suspend/resume (and CPU hotplug generally) ejects the scheduler
-    // with a restart action code; re-initialize until told otherwise.
+    // with a restart action code. Normally we re-initialize in place;
+    // with privileges dropped that's impossible, so we exit non-zero and
+    // rely on the service manager's Restart=on-failure instead.
+    //
+    // Thread-spawning order matters for drop_privs: capabilities are
+    // per-thread, so everything that starts a thread (stats server, the
+    // --stats monitor) is launched only after the drop.
     let mut open_object = MaybeUninit::uninit();
+    let mut stats_server = None;
     loop {
         let mut sched = Scheduler::init(&opts, config.clone(), &mut open_object)?;
-        let uei = sched.run(shutdown.clone())?;
+        if drop_privs && stats_server.is_none() {
+            drop_all_capabilities()?;
+        }
+        if stats_server.is_none() {
+            stats_server = Some(StatsServer::new(stats::server_data()).launch()?);
+            if let Some(intv) = opts.stats {
+                std::thread::spawn(move || {
+                    let _ = stats::monitor(Duration::from_secs_f64(intv));
+                });
+            }
+        }
+        let uei = sched.run(stats_server.as_ref().unwrap())?;
         drop(sched);
-        if shutdown.load(Ordering::Relaxed) || !uei.should_restart() {
+        if SHUTDOWN.load(Ordering::Relaxed) || !uei.should_restart() {
             uei.report()?;
             return Ok(());
         }
+        if drop_privs {
+            let _ = uei.report();
+            bail!(
+                "scheduler ejected (hotplug/suspend) with privileges dropped; \
+                 exiting for the service manager to restart"
+            );
+        }
         info!("scheduler ejected for restart (hotplug/suspend); re-initializing");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Capabilities are per-thread, so this only affects the test thread.
+    /// The bounding-set assertion needs CAP_SETPCAP, so it's root-only.
+    #[test]
+    fn capability_drop_zeroes_the_thread_sets() {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: needs root");
+            return;
+        }
+        super::drop_all_capabilities().unwrap();
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        for line in status.lines() {
+            if ["CapEff:", "CapPrm:", "CapInh:", "CapBnd:", "CapAmb:"]
+                .iter()
+                .any(|p| line.starts_with(p))
+            {
+                let val = line.split_whitespace().nth(1).unwrap();
+                assert_eq!(u64::from_str_radix(val, 16).unwrap(), 0, "{line}");
+            }
+        }
     }
 }

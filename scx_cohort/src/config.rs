@@ -57,6 +57,11 @@ pub struct OptionsTable {
     pub merge_wakes_per_sec: Option<f64>,
     /// SCHED_FIFO priority for the daemon; 0 disables the RT boost.
     pub rt_priority: Option<i32>,
+    /// Drop ALL capabilities once the scheduler is attached. The daemon
+    /// then cannot re-load BPF after a suspend/resume ejection, so it
+    /// exits instead and relies on the service manager's
+    /// Restart=on-failure to relaunch it with fresh privileges.
+    pub drop_privs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +233,13 @@ pin_ccd = 1
         assert_eq!(cfg.options.rt_priority, Some(0));
         assert!(cfg.options.interval_ms.is_none());
         assert_eq!(cfg.rules.len(), 1);
+    }
+
+    #[test]
+    fn drop_privs_option_parses() {
+        let cfg = Config::parse("[options]\ndrop_privs = true").unwrap();
+        assert_eq!(cfg.options.drop_privs, Some(true));
+        assert!(Config::parse("").unwrap().options.drop_privs.is_none());
     }
 
     #[test]
