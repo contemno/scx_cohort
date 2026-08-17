@@ -161,6 +161,36 @@ journalctl --namespace scx-cohort -u scx_cohort -f
 The unit restarts the daemon on failure and also sets the RT scheduling
 class as defense in depth.
 
+## Hardening
+
+The daemon's privilege needs are front-loaded: loading and attaching the
+scheduler requires `CAP_BPF` + `CAP_SYS_ADMIN` (+ `CAP_PERFMON` on some
+kernels) and the RT boost needs `CAP_SYS_NICE`, but steady-state
+operation — map access through already-open fds, world-readable procfs
+and sysfs reads, a unix stats socket — needs no capabilities at all.
+
+The shipped unit sandboxes accordingly: capability bounding set trimmed
+to those four, read-only filesystem (`ProtectSystem=strict`, the stats
+socket dir in `/run/scx` is the only writable path), no network
+(`PrivateNetwork=yes`; the AF_UNIX stats socket still works), no module
+loading, kernel tunables/logs/clock protected, namespaces and personality
+locked, W^X memory, and a seccomp allow-list (`@system-service` plus
+`bpf` and `sched_setscheduler`, which no `@` group covers). Deliberately
+NOT set, because this daemon needs them: `RestrictRealtime` (would break
+the SCHED_FIFO boost) and `ProtectProc=invisible`/`ProcSubset=pid` (rule
+matching reads other processes' `/proc/<pid>/cgroup`). Measure with
+`systemd-analyze security scx_cohort`.
+
+For a full post-attach drop, set `drop_privs = true` in `[options]` (or
+pass `--drop-privs`): once the scheduler is attached the daemon
+irrevocably drops **all** capabilities (ambient, bounding, and the
+per-thread sets — the process is kept single-threaded until the drop so
+no thread retains privileges) plus `no_new_privs`. The tradeoff: it can
+no longer re-load BPF after a suspend/resume ejection, so it exits
+instead and relies on the unit's `Restart=on-failure` to relaunch it
+with fresh privileges. Enable it when running under systemd; standalone
+runs would need an external restart mechanism to survive suspend.
+
 ## Development
 
 ```sh

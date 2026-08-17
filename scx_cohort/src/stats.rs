@@ -8,9 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -344,11 +342,11 @@ pub fn server_data() -> StatsServerData<StatsReq, StatsRes> {
         )
 }
 
-pub fn monitor(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn monitor(intv: Duration) -> Result<()> {
     scx_utils::monitor_stats::<Metrics>(
         &[],
         intv,
-        || shutdown.load(Ordering::Relaxed),
+        || crate::SHUTDOWN.load(Ordering::Relaxed),
         |metrics| metrics.format(&mut std::io::stdout()),
     )
 }

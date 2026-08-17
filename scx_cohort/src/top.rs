@@ -7,8 +7,7 @@
 //! served by the running scheduler's stats socket. Plain ANSI redraws — no
 //! TUI dependencies, works over ssh.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -87,11 +86,11 @@ fn render(s: &ProcsSnapshot) {
     println!();
 }
 
-pub fn run(intv: Duration, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn run(intv: Duration) -> Result<()> {
     scx_utils::monitor_stats::<ProcsSnapshot>(
         &[("target".into(), "procs".into())],
         intv,
-        || shutdown.load(Ordering::Relaxed),
+        || crate::SHUTDOWN.load(Ordering::Relaxed),
         |snapshot| {
             render(&snapshot);
             Ok(())

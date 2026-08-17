@@ -17,5 +17,46 @@ LogNamespace=scx-cohort
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=10
 
+# ---- Hardening ----------------------------------------------------------
+# The daemon needs CAP_BPF + CAP_SYS_ADMIN (+ CAP_PERFMON on some kernels)
+# to load/attach the scheduler — including on re-init after suspend — and
+# CAP_SYS_NICE for its RT boost. Everything else is dropped. For a full
+# post-attach capability drop, set drop_privs = true in the config
+# ([options]); the daemon then exits on suspend/resume ejection and
+# Restart=on-failure relaunches it with fresh privileges.
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN CAP_PERFMON CAP_SYS_NICE
+NoNewPrivileges=yes
+
+# Whole filesystem read-only to us; the only writable spot is the stats
+# socket directory (/run/scx, used by `scx_cohort top` and scxtop).
+ProtectSystem=strict
+RuntimeDirectory=scx
+ProtectHome=yes
+PrivateTmp=yes
+
+# Zero network: the stats socket is AF_UNIX (filesystem-based, reachable
+# from outside the private network namespace).
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+# We read /proc/<pid>/cgroup (procfs), never cgroupfs, so cgroupfs can be
+# read-only. Do NOT set ProtectProc=invisible or ProcSubset=pid: rule
+# matching must see other processes' /proc entries.
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+ProtectHostname=yes
+DevicePolicy=closed
+SystemCallArchitectures=native
+# No seccomp group includes bpf(2); it must be listed explicitly.
+# Do NOT set RestrictRealtime=yes — it would break the SCHED_FIFO boost.
+SystemCallFilter=@system-service bpf sched_setscheduler
+
 [Install]
 WantedBy=multi-user.target
