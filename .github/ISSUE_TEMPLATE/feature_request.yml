@@ -1,0 +1,60 @@
+name: ✨ Feature request
+description: Suggest a new capability or improvement
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Check the roadmap/milestones first in case it's
+        already planned.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and this isn't already proposed
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what's getting in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should it do? Sketch the UX or workflow if you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, or other approaches you weighed.
+
+  # Surface the project's core guarantees at the moment work is proposed.
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Project invariants
+      description: Does this proposal respect the guarantees this project must not break?
+      options:
+        - label: >-
+            Rust stays the single source of truth for the BPF↔userspace ABI:
+            shared structs/constants change only in scx_cohort_common (intf.h is
+            generated, never hand-edited), and the layout tests move with them —
+            or I've noted why this proposal is an exception.
+        - label: >-
+            The BPF per-wakeup hot path keeps making decisions from map lookups
+            only (no new unbounded work on the wakeup/dispatch path) — or I've
+            noted the cost.
+        - label: >-
+            The scheduler remains safely detachable: daemon exit, Ctrl-C, panic,
+            or the sched_ext watchdog still falls back cleanly to EEVDF — or
+            I've noted how this affects it.

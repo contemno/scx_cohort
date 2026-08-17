@@ -1,0 +1,20 @@
+# Structured forms are the recommended starting points, but blank issues stay
+# enabled so maintainers can open planning / roadmap / epic / spike issues that
+# don't fit a triage form.
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Security vulnerability (do NOT open a public issue)
+    url: https://github.com/contemno/scx_cohort/security/advisories/new
+    about: >-
+      Report anything that could be exploited privately via a GitHub security
+      advisory — never as a public issue.
+  - name: 💬 Question / usage help
+    url: https://github.com/contemno/scx_cohort/discussions
+    about: >-
+      Not sure if it's a bug? Ask in Discussions. Setup and usage questions are a
+      better fit there than the issue tracker.
+  - name: 🗺️ Roadmap & milestones
+    url: https://github.com/contemno/scx_cohort/milestones
+    about: >-
+      Planned and in-progress work is tracked in milestones. Check there before
+      proposing long-horizon work.

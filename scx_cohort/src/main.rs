@@ -391,8 +391,7 @@ impl<'a> Scheduler<'a> {
         for t in tasks {
             *task_counts.entry(t.cohort_id).or_default() += 1;
         }
-        let referenced: std::collections::HashSet<u64> =
-            tgid_cohort.values().copied().collect();
+        let referenced: std::collections::HashSet<u64> = tgid_cohort.values().copied().collect();
 
         // A failed/empty task scan must not read as "every cohort died".
         let gc_safe = !tasks.is_empty();
@@ -535,7 +534,11 @@ impl<'a> Scheduler<'a> {
                 .unwrap_or((ts.runtime_sum, ts.runtime_home_sum));
             seen.insert(pid, (ts.runtime_sum, ts.runtime_home_sum));
 
-            let comm_len = ts.comm.iter().position(|&b| b == 0).unwrap_or(ts.comm.len());
+            let comm_len = ts
+                .comm
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(ts.comm.len());
             out.push(TaskSnapshot {
                 pid,
                 tgid: ts.tgid,
@@ -578,7 +581,8 @@ impl<'a> Scheduler<'a> {
         }
 
         let live_tgids: std::collections::HashSet<u32> = tasks.iter().map(|t| t.tgid).collect();
-        self.cgroup_cache.retain(|tgid, _| live_tgids.contains(tgid));
+        self.cgroup_cache
+            .retain(|tgid, _| live_tgids.contains(tgid));
 
         let mut overrides = HashMap::new();
         let mut pins: HashMap<u64, u32> = HashMap::new();
@@ -743,8 +747,7 @@ impl<'a> Scheduler<'a> {
         let deltas = self.snapshot_edges()?;
         self.wake_graph.observe(&deltas, dt_s, self.sample_mult);
 
-        let cohort_sizes: HashMap<u64, u64> =
-            cohorts.iter().map(|c| (c.id, c.nr_tasks)).collect();
+        let cohort_sizes: HashMap<u64, u64> = cohorts.iter().map(|c| (c.id, c.nr_tasks)).collect();
 
         for plan in self.wake_graph.merges(tgid_cohort, &cohort_sizes) {
             self.apply_merge(plan, tgid_cohort)?;
@@ -757,10 +760,10 @@ impl<'a> Scheduler<'a> {
         let mut cohort_tgids: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
         for (&tgid, &cohort) in tgid_cohort {
             if cohort_sizes.contains_key(&cohort) {
-                cohort_tgids.entry(cohort).or_default().push((
-                    tgid,
-                    tgid_tasks.get(&tgid).copied().unwrap_or(0),
-                ));
+                cohort_tgids
+                    .entry(cohort)
+                    .or_default()
+                    .push((tgid, tgid_tasks.get(&tgid).copied().unwrap_or(0)));
             }
         }
         for plan in self.wake_graph.splits(&cohort_tgids) {
@@ -805,7 +808,10 @@ impl<'a> Scheduler<'a> {
                     let Ok(mut policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
                         continue;
                     };
-                    debug!("moving cohort {} from LLC {} to {}", id, policy.home_llc, to);
+                    debug!(
+                        "moving cohort {} from LLC {} to {}",
+                        id, policy.home_llc, to
+                    );
                     policy.home_llc = to;
                     policy_map.update(&key, policy.as_bytes(), MapFlags::EXIST)?;
                     self.nr_migrations += 1;
@@ -1015,11 +1021,7 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     let explicit = matches.value_source("config") == Some(ValueSource::CommandLine);
     let cfg = if opts.config.exists() {
         let cfg = config::Config::load(&opts.config)?;
-        info!(
-            "loaded {} rule(s) from {:?}",
-            cfg.rules.len(),
-            opts.config
-        );
+        info!("loaded {} rule(s) from {:?}", cfg.rules.len(), opts.config);
         cfg
     } else if explicit {
         bail!("config file {:?} not found", opts.config);
