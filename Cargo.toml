@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["scx_cohort_common", "scx_cohort"]
+members = ["scx_cohort_common", "scx_cohort", "bench/ipc_pingpong"]
 
 [workspace.package]
 version = "0.1.0"

@@ -111,13 +111,15 @@ if [[ -v "SCHED_CMDS[cohort]" ]]; then
 	done
 fi
 
-PINGPONG="$BENCH_DIR/ipc_pingpong"
-if [[ ! -x $PINGPONG || $BENCH_DIR/ipc_pingpong.c -nt $PINGPONG ]]; then
-	log "building ipc_pingpong"
-	cc -O2 -o "$PINGPONG" "$BENCH_DIR/ipc_pingpong.c" || die "cc failed"
-fi
-
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# The microbenchmark is a workspace crate; a no-op rebuild is instant.
+PINGPONG="$REPO_ROOT/target/release/ipc_pingpong"
+if have cargo; then
+	cargo build --release -q -p ipc_pingpong \
+		--manifest-path "$REPO_ROOT/Cargo.toml" || die "cargo build failed"
+fi
+[[ -x $PINGPONG ]] || die "ipc_pingpong missing; run: cargo build --release -p ipc_pingpong"
 
 if [[ $USE_PERF == auto ]]; then
 	if have perf && [[ $EUID -eq 0 ]] && \

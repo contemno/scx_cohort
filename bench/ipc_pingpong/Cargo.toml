@@ -1,0 +1,10 @@
+[package]
+name = "ipc_pingpong"
+description = "Cache-line-bouncing IPC microbenchmark for the scx_cohort bench suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = "0.2"

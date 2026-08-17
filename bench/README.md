@@ -64,7 +64,9 @@ sudo bench/run-suite.sh --sched lavd=/usr/bin/scx_lavd \
 
 ## The built-in workloads
 
-- **`pingpong` / `pingpong_loaded`** (`ipc_pingpong.c`) — the thesis test.
+- **`pingpong` / `pingpong_loaded`** (the `ipc_pingpong` workspace crate,
+  built by the same `cargo build --release` as the scheduler) — the thesis
+  test.
   Pairs of processes exchange messages through shared memory with futex
   wakeups, and every message walks the buffer cache line by cache line, so
   line ownership ping-pongs between the processes exactly like Chrome's
