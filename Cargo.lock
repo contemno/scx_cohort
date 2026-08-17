@@ -556,6 +556,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc_pingpong"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
