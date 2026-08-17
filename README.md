@@ -191,6 +191,24 @@ instead and relies on the unit's `Restart=on-failure` to relaunch it
 with fresh privileges. Enable it when running under systemd; standalone
 runs would need an external restart mechanism to survive suspend.
 
+## Benchmarking
+
+`bench/` holds an A/B harness for proving (or disproving) the design
+against the default scheduler on real hardware:
+
+```sh
+cargo build --release
+sudo bench/run-suite.sh          # interleaved eevdf-vs-cohort rounds
+python3 bench/analyze.py bench/results/<timestamp>/results.csv
+```
+
+It runs a cache-line-bouncing IPC microbenchmark modeled on the Chrome/
+Wine failure mode plus schbench/hackbench, records migration counts and
+the scheduler's achieved affinity per run, and the analyzer reports
+median deltas with Mann-Whitney significance tests. Game (MangoHud) and
+Chrome (Speedometer) measurement flows, and the full methodology
+checklist, are in [bench/README.md](bench/README.md).
+
 ## Development
 
 ```sh

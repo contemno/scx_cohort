@@ -129,7 +129,20 @@ The daemon computes per-CCD load as the sum of member tasks' duty cycles (tracke
 
 Three rules keep this stable. Whole cohorts move; the balancer never splits one to fix a number. Hysteresis is mandatory: a cohort that just moved is immune for `min_ccd_residency_ms` (default 2 s). And oversized cohorts get spill handling instead of relocation: a cohort whose runnable demand exceeds one CCD (Chrome with 30 renderers, a 24-thread game) keeps its home CCD for its hottest threads, and the daemon marks its coldest members (lowest duty cycle, weakest wake-edge connectivity, e.g. idle background renderers) as spillable, allowing their `select_cpu` to use the other CCD. Spill choice is sticky per task, so the *same* threads stay remote instead of the whole cohort churning across the boundary.
 
-### 4.4 Chrome and Wine walkthroughs
+### 4.4 Daemon scheduling class: SCHED_FIFO, not SCHED_DEADLINE
+
+The daemon raises itself to `SCHED_FIFO 10` (and the systemd unit sets the same policy as a backstop). The point of the boost is narrow: RT sits above sched_ext in the class hierarchy, so an RT daemon can never be starved by the scheduling class it implements. It is not a latency guarantee — the BPF side makes every per-wakeup decision, and the daemon is a 5 Hz control loop that sleeps almost all the time.
+
+`SCHED_DEADLINE` also outranks sched_ext, and looks tempting on paper: the tick is genuinely periodic, a runtime/period budget would hard-cap a buggy spinning daemon, and there'd be no magic priority number to pick. It loses on deployment fragility and on being *more* privilege than the job needs:
+
+- **Admission control makes the boost unreliable.** `sched_setattr(SCHED_DEADLINE)` is rejected when the task's affinity doesn't span the root domain — any `CPUAffinity=`, taskset, or cpuset restriction silently defeats it — and when other DL tasks hold the bandwidth. FIFO has no admission control; the warn-and-continue path stays a rarity instead of firing on exactly the complicated systems where the protection matters most.
+- **systemd can't set it.** `CPUSchedulingPolicy=` supports fifo/rr but not deadline, so the unit-level backstop disappears. DEADLINE is also strictly per-thread and not inherited, so the stats-server threads would each need their own `sched_setattr`, versus inheriting FIFO from the unit at exec.
+- **DEADLINE outranks the entire RT class.** On a box with PREEMPT_RT irq threads or audio threads at FIFO 70–99, a DL daemon preempts all of them every tick. FIFO 10 is the minimal sufficient rung: above every sched_ext task, below latency-critical RT work.
+- **The budget can't be sized honestly.** Tick cost scales with task and cohort count, and the stats server wakes the loop asynchronously, so demand isn't purely periodic. Undersize the budget and a tick gets throttled mid-scan on a busy machine — exactly when the balancer matters; oversize it and the containment benefit that motivated DL is gone. Meanwhile FIFO's runaway-spin risk is already bounded by the kernel's RT throttling, and `--no-rt` exists.
+
+The trade would flip if the daemon ever became the hot path (a userspace-dispatch design where scheduling decisions wait on it, à la scx_rustland); bounded tardiness would then be worth the admission-control fragility. For a control-plane daemon with a fallback-safe BPF data plane, it isn't.
+
+### 4.5 Chrome and Wine walkthroughs
 
 **Chrome:** browser forks zygote forks renderers/GPU process; lineage puts everything in one cohort with home on, say, CCD0. Mojo wakeups stay intra-L3. When tab count pushes demand past 8 cores, background renderers (near-zero duty cycle, no recent wake edges to the GPU process) spill to CCD1, while the focused renderer, GPU, and browser processes hold CCD0. The compositor chain never crosses the fabric.
 
