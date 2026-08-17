@@ -118,7 +118,9 @@ impl Metrics {
             nr_prev_idle: self.nr_prev_idle.saturating_sub(rhs.nr_prev_idle),
             nr_idle_core: self.nr_idle_core.saturating_sub(rhs.nr_idle_core),
             nr_idle_smt: self.nr_idle_smt.saturating_sub(rhs.nr_idle_smt),
-            nr_home_miss_clamp: self.nr_home_miss_clamp.saturating_sub(rhs.nr_home_miss_clamp),
+            nr_home_miss_clamp: self
+                .nr_home_miss_clamp
+                .saturating_sub(rhs.nr_home_miss_clamp),
             nr_enq_home: self.nr_enq_home.saturating_sub(rhs.nr_enq_home),
             nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
             nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),
@@ -387,8 +389,16 @@ mod tests {
             t(201, 200, tick_ns / 4, 0, "helper"),
         ];
         let llcs = [
-            LlcLoad { llc: 0, load_ns: 0, capacity_ns: tick_ns * 8 },
-            LlcLoad { llc: 1, load_ns: tick_ns, capacity_ns: tick_ns * 8 },
+            LlcLoad {
+                llc: 0,
+                load_ns: 0,
+                capacity_ns: tick_ns * 8,
+            },
+            LlcLoad {
+                llc: 1,
+                load_ns: tick_ns,
+                capacity_ns: tick_ns * 8,
+            },
         ];
         let spills: HashMap<u32, u32> = [(201, 0)].into();
 

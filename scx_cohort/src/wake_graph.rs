@@ -196,8 +196,7 @@ impl WakeGraph {
             }
 
             // Union-find over member tgids using live edges.
-            let mut parent: HashMap<u32, u32> =
-                members.iter().map(|&(t, _)| (t, t)).collect();
+            let mut parent: HashMap<u32, u32> = members.iter().map(|&(t, _)| (t, t)).collect();
             fn find(parent: &mut HashMap<u32, u32>, x: u32) -> u32 {
                 let p = parent[&x];
                 if p == x {
@@ -382,8 +381,7 @@ mod tests {
     #[test]
     fn momentary_disconnect_does_not_split() {
         let mut g = WakeGraph::new(cfg());
-        let members: HashMap<u64, Vec<(u32, u64)>> =
-            [(1u64, vec![(10, 8), (20, 4)])].into();
+        let members: HashMap<u64, Vec<(u32, u64)>> = [(1u64, vec![(10, 8), (20, 4)])].into();
 
         // Disconnected for a few ticks (below confirm), then the bridge
         // returns: the streak must reset.

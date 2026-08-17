@@ -68,7 +68,11 @@ fn render(s: &ProcsSnapshot) {
             lines.push(format!(
                 "  {:<8} {:<18} {:>4} {:>5}{:>3} {:>7.1} {:>9.1}",
                 p.tgid,
-                if p.comm.len() > 18 { &p.comm[..18] } else { &p.comm },
+                if p.comm.len() > 18 {
+                    &p.comm[..18]
+                } else {
+                    &p.comm
+                },
                 "",
                 p.threads,
                 if p.spilled > 0 {

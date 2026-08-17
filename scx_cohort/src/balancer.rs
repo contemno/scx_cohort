@@ -103,13 +103,21 @@ impl Balancer {
             // that repairs it best, and among equals the smaller one (less
             // cache state to re-warm on the other CCD).
             .filter(|c| (gap as i64 - 2 * c.load_ns as i64).unsigned_abs() < gap)
-            .min_by_key(|c| ((gap as i64 - 2 * c.load_ns as i64).unsigned_abs(), c.load_ns));
+            .min_by_key(|c| {
+                (
+                    (gap as i64 - 2 * c.load_ns as i64).unsigned_abs(),
+                    c.load_ns,
+                )
+            });
 
         match best {
             Some(c) => {
                 self.last_move_at.insert(c.id, now_ms);
                 self.streak = 0;
-                vec![Decision::MoveCohort { id: c.id, to: min.llc }]
+                vec![Decision::MoveCohort {
+                    id: c.id,
+                    to: min.llc,
+                }]
             }
             None => vec![],
         }
@@ -208,9 +216,7 @@ pub fn plan_spills(
         let mut members: Vec<&TaskSnapshot> = tasks
             .iter()
             .filter(|t| {
-                t.cohort_id == cohort.id
-                    && !already.contains(&t.pid)
-                    && t.duty_ns < cold_ceiling
+                t.cohort_id == cohort.id && !already.contains(&t.pid) && t.duty_ns < cold_ceiling
             })
             .collect();
         members.sort_by_key(|t| t.duty_ns);
@@ -387,7 +393,13 @@ mod tests {
         let llcs = [llc(0, CAP / 2, CAP), llc(1, 0, CAP)];
         let cohorts = [cohort(1, 0, CAP / 2)];
         let tasks: Vec<_> = (0..4).map(|i| task(i, 1, CAP / 8)).collect();
-        let out = plan_spills(&SpillCfg::default(), &llcs, &cohorts, &tasks, &HashMap::new());
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
         assert!(out.is_empty());
     }
 
@@ -405,7 +417,13 @@ mod tests {
             task(11, 1, CAP / 50),
             task(12, 1, CAP / 100),
         ];
-        let out = plan_spills(&SpillCfg::default(), &llcs, &cohorts, &tasks, &HashMap::new());
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
         assert!(!out.is_empty());
         // Only cold members spill, all to LLC 1, and the hot three stay.
         for pid in [1, 2, 3] {
@@ -429,7 +447,13 @@ mod tests {
             task(10, 1, CAP / 50),
             task(11, 1, CAP / 50),
         ];
-        let first = plan_spills(&SpillCfg::default(), &llcs, &cohorts, &tasks, &HashMap::new());
+        let first = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
         let second = plan_spills(&SpillCfg::default(), &llcs, &cohorts, &tasks, &first);
         // Whatever was spilled stays spilled while overload persists.
         for pid in first.keys() {

@@ -12,8 +12,8 @@ fn main() {
     // Rust is the source of truth for shared types: generate the C header
     // the BPF component includes. Written next to main.bpf.c (gitignored)
     // so its relative #include resolves without custom cflags.
-    let config = cbindgen::Config::from_file(common_dir.join("cbindgen.toml"))
-        .expect("read cbindgen.toml");
+    let config =
+        cbindgen::Config::from_file(common_dir.join("cbindgen.toml")).expect("read cbindgen.toml");
     cbindgen::Builder::new()
         .with_crate(&common_dir)
         .with_config(config)

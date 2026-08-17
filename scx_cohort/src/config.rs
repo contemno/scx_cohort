@@ -173,10 +173,15 @@ pin_ccd = 0
     fn cgroup_glob_match() {
         let cfg = Config::parse(SAMPLE).unwrap();
         let rule = cfg
-            .match_task("GameThread", "user.slice/user-1000.slice/app-steam-12345.scope")
+            .match_task(
+                "GameThread",
+                "user.slice/user-1000.slice/app-steam-12345.scope",
+            )
             .expect("glob should match");
         assert_eq!(rule.min_ccd_residency_ms, Some(5000));
-        assert!(cfg.match_task("GameThread", "system.slice/sshd.service").is_none());
+        assert!(cfg
+            .match_task("GameThread", "system.slice/sshd.service")
+            .is_none());
     }
 
     #[test]
@@ -244,7 +249,9 @@ pin_ccd = 1
     #[test]
     fn bad_configs_rejected() {
         // Unknown join target.
-        assert!(Config::parse("[[rule]]\nmatch_comm=[\"a\"]\njoin_cohort_of=\"grandparent\"").is_err());
+        assert!(
+            Config::parse("[[rule]]\nmatch_comm=[\"a\"]\njoin_cohort_of=\"grandparent\"").is_err()
+        );
         // No matcher at all.
         assert!(Config::parse("[[rule]]\npin_ccd = 1").is_err());
         // Unknown key (typo protection).
