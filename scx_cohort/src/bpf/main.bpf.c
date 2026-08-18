@@ -15,7 +15,8 @@
  * Placement model: each LLC (CCD) has one vtime-ordered DSQ whose id is
  * the LLC id. A task's cohort has a home LLC; select_cpu never looks for
  * idle CPUs outside it, and dispatch steals across LLCs only through a
- * priced gate. Cohorts form from tgid grouping and fork lineage here;
+ * priced gate. Cohorts form from tgid grouping and fork lineage here and
+ * are severed at exec (a new program image starts a fresh cohort);
  * wake-edge driven merges/splits arrive with the daemon in later phases.
  */
 #include <scx/common.bpf.h>
@@ -589,10 +590,24 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 	}
 }
 
+/* Mint a fresh cohort with a round-robin home LLC. */
+static u64 new_cohort(void)
+{
+	struct CohortPolicy policy = {
+		.home_llc = __sync_fetch_and_add(&rr_ctr, 1) % nr_llcs,
+	};
+	struct CohortCounters counters = {};
+	u64 id = __sync_fetch_and_add(&cohort_seq, 1) + 1;
+
+	bpf_map_update_elem(&cohort_policy, &id, &policy, BPF_NOEXIST);
+	bpf_map_update_elem(&cohort_counters, &id, &counters, BPF_NOEXIST);
+	return id;
+}
+
 /*
  * Assign @p to a cohort: existing tgid mapping first, then fork lineage
  * (current is the forking parent when args->fork is set), then a fresh
- * cohort with a round-robin home LLC.
+ * cohort.
  */
 static u64 assign_cohort(struct task_struct *p, bool fork)
 {
@@ -612,19 +627,80 @@ static u64 assign_cohort(struct task_struct *p, bool fork)
 			id = ptctx->cohort_id;
 	}
 
-	if (id == COHORT_INVALID) {
-		struct CohortPolicy policy = {
-			.home_llc = __sync_fetch_and_add(&rr_ctr, 1) % nr_llcs,
-		};
-		struct CohortCounters counters = {};
-
-		id = __sync_fetch_and_add(&cohort_seq, 1) + 1;
-		bpf_map_update_elem(&cohort_policy, &id, &policy, BPF_NOEXIST);
-		bpf_map_update_elem(&cohort_counters, &id, &counters, BPF_NOEXIST);
-	}
+	if (id == COHORT_INVALID)
+		id = new_cohort();
 
 	bpf_map_update_elem(&tgid_cohort, &tgid, &id, BPF_ANY);
 	return id;
+}
+
+/*
+ * exec is a program-identity boundary. Fork lineage groups the tree a
+ * program builds for itself (Chrome's zygote forking renderers), but
+ * letting membership survive exec chains every unrelated binary a shell
+ * or launcher spawns into its ancestor's cohort — everything descending
+ * from one terminal collapses into a single machine-wide cohort homed on
+ * one CCD. Sever here: the exec'ing task leaves the lineage cohort and
+ * starts a fresh one, exactly like a fresh top-level task. Related
+ * processes that are launched via fork+exec (game ↔ wineserver, browser
+ * ↔ GPU process) are re-merged by the daemon from their observed wake
+ * edges within about a second of them actually talking.
+ */
+SEC("tp_btf/sched_process_exec")
+int BPF_PROG(cohort_exec_sever, struct task_struct *p, pid_t old_pid,
+	     struct linux_binprm *bprm)
+{
+	struct CohortCounters *counters;
+	struct CohortPolicy *policy;
+	struct TaskCtx *tctx;
+	u32 tgid = p->tgid;
+	u64 id;
+
+	tctx = bpf_task_storage_get(&task_ctxs, p, 0, 0);
+	if (!tctx)
+		return 0;
+
+	/* Leave the lineage cohort; the daemon GCs it if now empty. */
+	id = resolve_cohort(p, tctx);
+	counters = bpf_map_lookup_elem(&cohort_counters, &id);
+	if (counters)
+		__sync_fetch_and_sub(&counters->nr_tasks, 1);
+
+	id = new_cohort();
+	bpf_map_update_elem(&tgid_cohort, &tgid, &id, BPF_ANY);
+	tctx->cohort_id = id;
+	counters = bpf_map_lookup_elem(&cohort_counters, &id);
+	if (counters)
+		__sync_fetch_and_add(&counters->nr_tasks, 1);
+
+	/*
+	 * A new program starts at its new home's vtime frontier, exactly as
+	 * init_task would place it; carrying the old cohort's vtime across
+	 * could park it far behind or ahead of the new LLC's clock.
+	 */
+	policy = bpf_map_lookup_elem(&cohort_policy, &id);
+	if (policy) {
+		struct llc_ctx *llcx = lookup_llc_ctx(safe_llc(policy->home_llc));
+
+		if (llcx)
+			tctx->vtime = llcx->vtime_now;
+	}
+
+	{
+		u32 pid = p->pid;
+		struct TaskStat *ts = bpf_map_lookup_elem(&task_stats, &pid);
+
+		/* exec replaced comm; keep the daemon's rule matching current. */
+		if (ts) {
+			ts->cohort_id = id;
+			__builtin_memcpy(ts->comm, p->comm, sizeof(ts->comm));
+		}
+		/* Any spill mark belonged to the old cohort's plan. */
+		bpf_map_delete_elem(&spill_tasks, &pid);
+	}
+
+	stat_inc(STAT_EXEC_SEVER);
+	return 0;
 }
 
 s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,

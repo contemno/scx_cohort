@@ -23,7 +23,8 @@ Hybrid BPF/userspace split, with **Rust as the single source of truth**:
   is a compile error, and layout tests pin the sizes).
 - **`scx_cohort/src/bpf/main.bpf.c`** — the kernel fast path: per-CCD
   vtime DSQs, the in-CCD CPU-selection ladder, gated cross-CCD stealing,
-  cohort formation from tgid/fork lineage, sampled wake-edge recording.
+  cohort formation from tgid/fork lineage (severed at exec), sampled
+  wake-edge recording.
   Every per-wakeup decision is made from map lookups only. The C header
   it includes (`intf.h`) is **generated from the common crate by
   cbindgen** at build time — nothing is defined twice, and the daemon

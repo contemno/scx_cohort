@@ -213,6 +213,8 @@ struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     // Dropping the link detaches the scheduler; hold it for our lifetime.
     _struct_ops: libbpf_rs::Link,
+    /// The sched_process_exec tracepoint that severs cohort lineage.
+    _exec_sever: libbpf_rs::Link,
     interval: Duration,
     started_at: Instant,
     balancer: Balancer,
@@ -325,11 +327,17 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, cohort_ops, uei)
             .context("BPF load failed — rerun with -vv to print the libbpf/verifier log")?;
         let struct_ops = scx_ops_attach!(skel, cohort_ops)?;
+        let exec_sever = skel
+            .progs
+            .cohort_exec_sever
+            .attach()
+            .context("attaching the sched_process_exec severing hook")?;
         info!("scx_cohort attached");
 
         Ok(Self {
             skel,
             _struct_ops: struct_ops,
+            _exec_sever: exec_sever,
             interval: Duration::from_millis(opts.interval_ms),
             started_at: Instant::now(),
             balancer: Balancer::new(BalancerCfg {
@@ -864,6 +872,7 @@ impl<'a> Scheduler<'a> {
             nr_enq_spill: c[STAT_ENQ_SPILL as usize],
             nr_steals: c[STAT_STEAL as usize],
             nr_tctx_errors: c[STAT_TCTX_ERR as usize],
+            nr_exec_severs: c[STAT_EXEC_SEVER as usize],
             nr_migrations: self.nr_migrations,
             nr_merges: self.nr_merges,
             nr_splits: self.nr_splits,

@@ -51,7 +51,8 @@ pub const STAT_ENQ_HOME: u32 = 5;
 pub const STAT_ENQ_SPILL: u32 = 6;
 pub const STAT_STEAL: u32 = 7;
 pub const STAT_TCTX_ERR: u32 = 8;
-pub const NR_STATS: u32 = 9;
+pub const STAT_EXEC_SEVER: u32 = 9;
+pub const NR_STATS: u32 = 10;
 
 /// Per-task scheduling state, stored in BPF task storage. Written almost
 /// exclusively by the BPF fast path; the daemon only reads it.
