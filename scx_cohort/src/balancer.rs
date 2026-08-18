@@ -125,10 +125,11 @@ impl Balancer {
 }
 
 /// Spill handling for cohorts whose demand exceeds one LLC (DESIGN.md
-/// §4.3): the cohort keeps its home for its hottest threads, and the
-/// coldest members run remotely. Selection is sticky — already-spilled
-/// tasks stay chosen while the overload lasts, so the *same* threads stay
-/// remote instead of the whole cohort churning across the boundary.
+/// §4.3): cold members run remotely first, and when that isn't enough the
+/// hottest CPU-bound members are exiled too, until home demand fits.
+/// Selection is sticky — already-spilled tasks stay chosen while the
+/// overload lasts, so the *same* threads stay remote instead of the whole
+/// cohort churning across the boundary.
 #[derive(Debug, Clone)]
 pub struct SpillCfg {
     /// A cohort spills when its load exceeds this percentage of its home
@@ -137,10 +138,18 @@ pub struct SpillCfg {
     /// ...and unspills entirely when it drops below this percentage
     /// (hysteresis gap).
     pub low_pct: u64,
-    /// Only tasks whose duty is below this percentage of one CPU's tick
-    /// time are cold enough to spill. Hot threads never run remotely:
-    /// if shedding every cold member still leaves the home overloaded,
-    /// the steal gate carries the remainder.
+    /// Members below this percentage of one CPU's tick time are "cold":
+    /// they spill first, coldest-first, at near-zero cost. If shedding
+    /// every cold member still leaves the home overloaded, hot members
+    /// spill too — hottest-first, because a CPU-bound thread rarely
+    /// sleeps on cohort mates and so pays the least for remoteness,
+    /// while often-waking latency-sensitive threads (which sort colder)
+    /// keep the home L3. An earlier revision never spilled hot members
+    /// and let the steal gate carry the remainder; on uniformly-hot
+    /// oversized cohorts (hackbench-class) that meant the other CCD
+    /// stole an arbitrary queue head on every dispatch — measured as
+    /// hundreds of thousands of cross-CCD migrations per second and an
+    /// affinity rate below a coin flip.
     pub cold_max_pct: u64,
     /// One CPU's worth of runtime per tick, for the cold ceiling.
     pub tick_ns: u64,
@@ -204,25 +213,37 @@ pub fn plan_spills(
             desired.insert(*pid, *current.get(pid).unwrap());
         }
 
-        if cohort.load_ns < high {
+        // Cohort load counts spilled members too (demand is charged
+        // wherever a task runs), so growth must be planned against what
+        // is still at home — otherwise every tick re-spills the same
+        // excess onto fresh victims and the whole cohort creeps across
+        // the boundary.
+        let spilled_duty: u64 = tasks
+            .iter()
+            .filter(|t| already.contains(&t.pid))
+            .map(|t| t.duty_ns)
+            .sum();
+        let home_load = cohort.load_ns.saturating_sub(spilled_duty);
+        if home_load < high {
             continue;
         }
 
-        // Grow the set: spill the coldest not-yet-spilled members until
-        // the remaining home demand fits under the high mark, or the cold
-        // candidates run out — whichever comes first.
-        let excess = cohort.load_ns - high;
+        // Grow the set until the remaining home demand fits under the
+        // high mark: cold members first (coldest-first, near-zero cost to
+        // run remotely), then — if the cold candidates run out — hot
+        // members, hottest-first, so CPU-bound hogs are exiled and the
+        // often-waking threads keep the home L3.
+        let excess = home_load - high;
         let cold_ceiling = cfg.tick_ns * cfg.cold_max_pct / 100;
-        let mut members: Vec<&TaskSnapshot> = tasks
+        let (mut cold, mut hot): (Vec<&TaskSnapshot>, Vec<&TaskSnapshot>) = tasks
             .iter()
-            .filter(|t| {
-                t.cohort_id == cohort.id && !already.contains(&t.pid) && t.duty_ns < cold_ceiling
-            })
-            .collect();
-        members.sort_by_key(|t| t.duty_ns);
+            .filter(|t| t.cohort_id == cohort.id && !already.contains(&t.pid))
+            .partition(|t| t.duty_ns < cold_ceiling);
+        cold.sort_by_key(|t| t.duty_ns);
+        hot.sort_by_key(|t| std::cmp::Reverse(t.duty_ns));
 
         let mut shed: u64 = 0;
-        for t in members {
+        for t in cold.into_iter().chain(hot) {
             if shed >= excess {
                 break;
             }
@@ -405,10 +426,10 @@ mod tests {
 
     #[test]
     fn oversized_cohort_spills_coldest_members() {
-        let llcs = [llc(0, CAP + CAP / 4, CAP), llc(1, 0, CAP)];
-        // Demand 125% of home capacity.
-        let cohorts = [cohort(1, 0, CAP + CAP / 4)];
-        // Three hot threads and three near-idle background ones.
+        // Demand just over the high mark: the excess (5% of capacity)
+        // is coverable by cold members alone, so hot threads stay home.
+        let llcs = [llc(0, CAP, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP)];
         let tasks = vec![
             task(1, 1, CAP / 3),
             task(2, 1, CAP / 3),
@@ -433,6 +454,88 @@ mod tests {
             assert!(pid >= 10);
             assert_eq!(target, 1);
         }
+    }
+
+    #[test]
+    fn hot_members_overflow_when_cold_insufficient() {
+        // Demand 125% of home capacity but the cold members cover only a
+        // sliver of the excess: hot members must spill too, and the spill
+        // must stop once enough demand has been shed — never the whole
+        // cohort.
+        let llcs = [llc(0, CAP + CAP / 4, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP + CAP / 4)];
+        let tasks = vec![
+            task(1, 1, CAP / 3),
+            task(2, 1, CAP / 3),
+            task(3, 1, CAP / 3),
+            task(10, 1, CAP / 100),
+        ];
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
+        // Cold member spills, plus exactly one hot member: excess is 30%
+        // of capacity and each hot member sheds 33%.
+        assert!(out.contains_key(&10), "cold member must spill first");
+        let hot_spilled: Vec<u32> = [1, 2, 3]
+            .into_iter()
+            .filter(|pid| out.contains_key(pid))
+            .collect();
+        assert_eq!(hot_spilled.len(), 1, "exactly one hot member overflows");
+        assert!(out.len() < tasks.len(), "the whole cohort must never spill");
+        for target in out.values() {
+            assert_eq!(*target, 1);
+        }
+    }
+
+    #[test]
+    fn hot_overflow_exiles_hogs_not_the_waking_thread() {
+        // One CPU's tick worth of runtime; duty is capped by it in
+        // practice. A render-style thread runs at half duty; the rest are
+        // full-duty hogs (shader compilers, spinners). Hottest-first
+        // overflow must exile hogs and keep the lighter thread home.
+        let tick = CAP / 8;
+        let mut tasks = vec![task(1, 1, tick / 2)];
+        for pid in 2..=16 {
+            tasks.push(task(pid, 1, tick));
+        }
+        // Demand double the home capacity, all of it hot.
+        let llcs = [llc(0, CAP * 2, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP * 2)];
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
+        assert!(
+            !out.contains_key(&1),
+            "the least-hot member must be the last exiled"
+        );
+        assert!(!out.is_empty());
+        assert!(out.len() < tasks.len());
+    }
+
+    #[test]
+    fn hot_overflow_is_sticky() {
+        let llcs = [llc(0, CAP + CAP / 4, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP + CAP / 4)];
+        // Uniformly hot: any spilled member is an arbitrary pick, which
+        // is exactly when re-planning could churn the choice.
+        let tasks: Vec<_> = (1..=8).map(|pid| task(pid, 1, CAP / 6)).collect();
+        let cfg = SpillCfg::default();
+        let first = plan_spills(&cfg, &llcs, &cohorts, &tasks, &HashMap::new());
+        assert!(!first.is_empty());
+        // The first plan shed enough; replanning under the same load must
+        // neither churn the picks nor creep more members across (cohort
+        // load still counts the spilled members, so a naive replan would
+        // spill the same excess again every tick).
+        let second = plan_spills(&cfg, &llcs, &cohorts, &tasks, &first);
+        assert_eq!(second, first, "spill set must converge, not grow");
     }
 
     #[test]
