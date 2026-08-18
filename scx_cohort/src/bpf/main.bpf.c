@@ -39,6 +39,7 @@ struct Tunables tunables = {
 	.credit_max_ns		= 4000000,
 	.credit_wake_freq_min	= 50,
 	.credit_runtime_max_ns	= 2000000,
+	.preempt_min_ns		= 20000,
 	.sample_shift		= 3,
 };
 
@@ -73,10 +74,20 @@ struct {
 	__uint(max_entries, MAX_LLCS);
 } llcs SEC(".maps");
 
-/* Per-CPU scratch state: cpumask for intersections, wake-edge sampling. */
+/*
+ * Per-CPU scratch state: cpumask for intersections, wake-edge sampling,
+ * and what this CPU is currently running as seen by remote preemption
+ * decisions. curr_interactive goes stale while the CPU idles, which is
+ * harmless: an idle CPU is found by the idle search before enqueue ever
+ * considers preempting it.
+ */
 struct scratch_ctx {
 	struct bpf_cpumask __kptr *mask;
 	u32 sample_ctr;
+	/* The running task fits the interactive signature (set in running). */
+	u32 curr_interactive;
+	/* Last time enqueue preempted this CPU; rate-limits the IPIs. */
+	u64 last_preempt_ts;
 };
 
 struct {
@@ -210,6 +221,18 @@ static struct llc_ctx *lookup_llc_ctx(u32 llc)
 static u32 safe_llc(u32 llc)
 {
 	return llc < nr_llcs ? llc : 0;
+}
+
+/*
+ * The interactive signature: woken often, running briefly (render
+ * threads, compositors, IPC pairs). Gates both the vtime credit and
+ * wakeup preemption.
+ */
+static bool task_interactive(const struct TaskCtx *tctx)
+{
+	return tctx->wake_freq >= tunables.credit_wake_freq_min &&
+	       tctx->avg_runtime_ns > 0 &&
+	       tctx->avg_runtime_ns <= tunables.credit_runtime_max_ns;
 }
 
 static u32 llc_of_cpu(s32 cpu)
@@ -455,16 +478,55 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 		vtime = vtime_now - slice_ns;
 
 	/*
-	 * Tasks with the interactive signature — woken often, running
-	 * briefly (render threads, compositors, audio) — jump the queue
-	 * within their CCD by a bounded credit. The clamp above plus this
-	 * fixed bound keep the unfairness finite, so batch tasks cannot be
-	 * starved past the watchdog's patience.
+	 * Tasks with the interactive signature jump the queue within their
+	 * CCD by a bounded credit. The clamp above plus this fixed bound
+	 * keep the unfairness finite, so batch tasks cannot be starved
+	 * past the watchdog's patience.
 	 */
-	if (tctx && tctx->wake_freq >= tunables.credit_wake_freq_min &&
-	    tctx->avg_runtime_ns > 0 &&
-	    tctx->avg_runtime_ns <= tunables.credit_runtime_max_ns)
+	if (tctx && task_interactive(tctx)) {
 		vtime -= tunables.credit_max_ns;
+
+		/*
+		 * Queue-jumping only helps once some CPU dispatches; with
+		 * every home CPU held by long-slice batch tasks the wakee
+		 * still waits out someone's slice (measured as pingpong
+		 * p50 doubling under per-CPU spinner load). Preempt the
+		 * wakee's cache-warm prev_cpu instead — but only on a real
+		 * wakeup, only if that CPU currently runs a task that is
+		 * NOT itself interactive (batch work can be displaced;
+		 * peers cannot, or all-interactive workloads like
+		 * hackbench would preempt each other on every message),
+		 * and at most once per victim CPU per preempt_min_ns.
+		 */
+		if ((enq_flags & SCX_ENQ_WAKEUP) && llcx) {
+			const struct cpumask *hmask = cast_mask(llcx->cpumask);
+			s32 prev = scx_bpf_task_cpu(p);
+
+			if (hmask && prev >= 0 &&
+			    bpf_cpumask_test_cpu(prev, hmask) &&
+			    bpf_cpumask_test_cpu(prev, p->cpus_ptr)) {
+				const u32 zero = 0;
+				struct scratch_ctx *vs =
+					bpf_map_lookup_percpu_elem(&scratch_stor,
+								   &zero, prev);
+				u64 pnow = scx_bpf_now();
+
+				if (vs && !vs->curr_interactive &&
+				    pnow - vs->last_preempt_ts >
+					    tunables.preempt_min_ns) {
+					/* Benign cross-CPU race: worst case
+					 * is one extra preempt. */
+					vs->last_preempt_ts = pnow;
+					stat_inc(STAT_PREEMPT);
+					scx_bpf_dsq_insert(p,
+						SCX_DSQ_LOCAL_ON | (u32)prev,
+						slice_ns,
+						enq_flags | SCX_ENQ_PREEMPT);
+					return;
+				}
+			}
+		}
+	}
 
 	if (llcx && !scx_bpf_dsq_nr_queued(llc))
 		llcx->head_enq_ts = scx_bpf_now();
@@ -548,6 +610,8 @@ void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 	struct TaskCtx *tctx = lookup_task_ctx(p);
 	u32 llc = llc_of_cpu(scx_bpf_task_cpu(p));
 	struct llc_ctx *llcx = lookup_llc_ctx(llc);
+	struct scratch_ctx *sctx;
+	const u32 zero = 0;
 
 	if (!tctx)
 		return;
@@ -555,6 +619,11 @@ void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 	tctx->last_run_at = scx_bpf_now();
 	if (llcx && vtime_before(llcx->vtime_now, tctx->vtime))
 		llcx->vtime_now = tctx->vtime;
+
+	/* Publish what this CPU runs, for remote preemption decisions. */
+	sctx = bpf_map_lookup_elem(&scratch_stor, &zero);
+	if (sctx)
+		sctx->curr_interactive = task_interactive(tctx);
 }
 
 void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)

@@ -52,7 +52,8 @@ pub const STAT_ENQ_SPILL: u32 = 6;
 pub const STAT_STEAL: u32 = 7;
 pub const STAT_TCTX_ERR: u32 = 8;
 pub const STAT_EXEC_SEVER: u32 = 9;
-pub const NR_STATS: u32 = 10;
+pub const STAT_PREEMPT: u32 = 10;
+pub const NR_STATS: u32 = 11;
 
 /// Per-task scheduling state, stored in BPF task storage. Written almost
 /// exclusively by the BPF fast path; the daemon only reads it.
@@ -156,6 +157,10 @@ pub struct Tunables {
     pub credit_wake_freq_min: u64,
     /// Maximum average runtime for the interactive credit.
     pub credit_runtime_max_ns: u64,
+    /// An interactive wakee may preempt its previous CPU (when that CPU
+    /// runs a non-interactive task) at most once per victim CPU per this
+    /// interval. Bounds the worst-case preemption IPI rate.
+    pub preempt_min_ns: u64,
     /// Wake-edge recording is sampled 1-in-2^sample_shift.
     pub sample_shift: u32,
     pub _pad: u32,
@@ -169,6 +174,7 @@ impl Default for Tunables {
             credit_max_ns: 4_000_000,
             credit_wake_freq_min: 50,
             credit_runtime_max_ns: 2_000_000,
+            preempt_min_ns: 20_000,
             sample_shift: 3,
             _pad: 0,
         }
@@ -192,7 +198,7 @@ mod tests {
         assert_eq!(size_of::<WakeEdgeKey>(), 8);
         assert_eq!(size_of::<TaskStat>(), 48);
         assert_eq!(align_of::<TaskStat>(), 8);
-        assert_eq!(size_of::<Tunables>(), 48);
+        assert_eq!(size_of::<Tunables>(), 56);
     }
 
     #[test]

@@ -112,6 +112,12 @@ struct Opts {
     #[clap(long, default_value = "500")]
     steal_delay_us: u64,
 
+    /// An interactive wakee may preempt its previous CPU (when that CPU
+    /// runs a non-interactive task) at most once per victim CPU per this
+    /// many microseconds. Raise to trade wakeup latency for fewer IPIs.
+    #[clap(long, default_value = "20")]
+    preempt_min_us: u64,
+
     /// Move a cohort when the inter-CCD load gap exceeds this percentage
     /// of one CCD's capacity for two consecutive ticks.
     #[clap(long, default_value = "20")]
@@ -178,6 +184,7 @@ impl Opts {
         Tunables {
             steal_min: self.steal_min,
             steal_delay_ns: self.steal_delay_us * 1000,
+            preempt_min_ns: self.preempt_min_us * 1000,
             ..Tunables::default()
         }
     }
@@ -313,6 +320,7 @@ impl<'a> Scheduler<'a> {
             let data = skel.maps.data_data.as_mut().unwrap();
             data.tunables.steal_min = t.steal_min;
             data.tunables.steal_delay_ns = t.steal_delay_ns;
+            data.tunables.preempt_min_ns = t.preempt_min_ns;
             data.tunables.credit_max_ns = t.credit_max_ns;
             data.tunables.credit_wake_freq_min = t.credit_wake_freq_min;
             data.tunables.credit_runtime_max_ns = t.credit_runtime_max_ns;
@@ -861,7 +869,8 @@ impl<'a> Scheduler<'a> {
                 c[STAT_SYNC_LOCAL as usize]
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
-                    + c[STAT_IDLE_SMT as usize],
+                    + c[STAT_IDLE_SMT as usize]
+                    + c[STAT_PREEMPT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
@@ -870,11 +879,13 @@ impl<'a> Scheduler<'a> {
                 c[STAT_SYNC_LOCAL as usize]
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
-                    + c[STAT_IDLE_SMT as usize],
+                    + c[STAT_IDLE_SMT as usize]
+                    + c[STAT_PREEMPT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
             ),
+            nr_preempts: c[STAT_PREEMPT as usize],
             nr_sync_local: c[STAT_SYNC_LOCAL as usize],
             nr_prev_idle: c[STAT_PREV_IDLE as usize],
             nr_idle_core: c[STAT_IDLE_CORE as usize],
@@ -1065,6 +1076,7 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     apply!(interval_ms);
     apply!(steal_min);
     apply!(steal_delay_us);
+    apply!(preempt_min_us);
     apply!(imbalance_pct);
     apply!(residency_ms);
     apply!(merge_wakes_per_sec);

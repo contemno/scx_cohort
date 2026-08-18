@@ -92,6 +92,7 @@ scheduler with a restart code; the daemon re-initializes automatically
 | `--interval-ms` | 200 | Daemon tick (balancer/discovery) interval. |
 | `--steal-min` | 2 | Steal across the fabric only when the foreign queue is deeper than this… |
 | `--steal-delay-us` | 500 | …and its head task has waited this long. Higher = stickier CCDs. |
+| `--preempt-min-us` | 20 | An interactive wakee preempts its prev CPU (if running batch work) at most this often per CPU. |
 | `--imbalance-pct` | 20 | Inter-CCD load gap (as % of one CCD) that triggers a cohort move. |
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |
@@ -116,6 +117,7 @@ slice_us = 5000
 interval_ms = 200
 steal_min = 2
 steal_delay_us = 500
+preempt_min_us = 20
 imbalance_pct = 20
 residency_ms = 2000
 merge_wakes_per_sec = 300.0
