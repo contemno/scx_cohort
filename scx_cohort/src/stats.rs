@@ -58,6 +58,8 @@ pub struct Metrics {
     #[stat(desc = "task context lookup failures (should stay 0)")]
     pub nr_tctx_errors: u64,
 
+    #[stat(desc = "cohorts started fresh at exec (lineage severed)")]
+    pub nr_exec_severs: u64,
     #[stat(desc = "cohort home moves by the load balancer")]
     pub nr_migrations: u64,
     #[stat(desc = "cohort merges from wake-edge discovery")]
@@ -74,13 +76,14 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={} spilled={}",
+            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={} execs={} spilled={}",
             self.nr_cohorts,
             self.nr_tasks,
             self.affinity_hit_pct,
             self.nr_migrations,
             self.nr_merges,
             self.nr_splits,
+            self.nr_exec_severs,
             self.nr_spilled,
         )?;
         writeln!(
@@ -123,6 +126,7 @@ impl Metrics {
             nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
             nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),
             nr_tctx_errors: self.nr_tctx_errors.saturating_sub(rhs.nr_tctx_errors),
+            nr_exec_severs: self.nr_exec_severs.saturating_sub(rhs.nr_exec_severs),
             nr_migrations: self.nr_migrations.saturating_sub(rhs.nr_migrations),
             nr_merges: self.nr_merges.saturating_sub(rhs.nr_merges),
             nr_splits: self.nr_splits.saturating_sub(rhs.nr_splits),
