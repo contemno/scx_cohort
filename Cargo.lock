@@ -602,7 +602,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
- "libbpf-rs",
+ "libbpf-rs 0.26.2",
  "memmap2",
  "serde",
  "serde_json",
@@ -616,6 +616,18 @@ name = "libbpf-rs"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd8e8db46a2d5967b5b3dba7aba32a875dc38f222395040607045635ec1f9b63"
+dependencies = [
+ "bitflags",
+ "libbpf-sys",
+ "libc",
+ "vsprintf",
+]
+
+[[package]]
+name = "libbpf-rs"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e69ad90c37d14f657291712f297a1460a1d1b647da45e0e372996b807c38f02"
 dependencies = [
  "bitflags",
  "libbpf-sys",
@@ -975,7 +987,7 @@ dependencies = [
  "glob",
  "lazy_static",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.26.2",
  "ruzstd",
  "sscanf",
  "tar",
@@ -996,7 +1008,7 @@ dependencies = [
  "crossbeam",
  "ctrlc",
  "globset",
- "libbpf-rs",
+ "libbpf-rs 0.27.0",
  "libc",
  "log",
  "scx_cargo",
@@ -1061,7 +1073,7 @@ dependencies = [
  "hex",
  "lazy_static",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.26.2",
  "libc",
  "log",
  "nix",
