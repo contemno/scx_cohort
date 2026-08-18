@@ -29,15 +29,21 @@ import sys
 from collections import defaultdict
 from itertools import combinations
 
-# Whether a bigger number is better, decided from the metric name. Metrics
-# not matched here are printed without a verdict arrow.
+# Whether a bigger number is better, decided from the metric name. Counts
+# of bad events are checked first: their rates would otherwise read as
+# wins via the "per_sec"/"ops" suffixes ("migrations_per_sec" is a cost,
+# not a throughput). Metrics not matched anywhere are printed without a
+# verdict arrow.
+BAD_EVENT = ("migrations", "misses", "faults", "drops", "stalls")
 HIGHER_BETTER = ("per_sec", "fps", "pct", "throughput", "ops", "score", "rps")
 LOWER_BETTER = ("_ns", "_us", "_usec", "_ms", "_sec", "latency", "time",
-                "migrations", "frametime")
+                "frametime")
 
 
 def direction(metric: str):
     m = metric.lower()
+    if any(k in m for k in BAD_EVENT):
+        return "lower"
     if any(k in m for k in HIGHER_BETTER):
         return "higher"
     if any(k in m for k in LOWER_BETTER):

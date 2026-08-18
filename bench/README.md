@@ -53,7 +53,10 @@ traced back to the output that produced it.
 (workload, metric) pair and tests each scheduler against the baseline with
 a two-sided Mann-Whitney U test (exact at these sample sizes). Nothing
 should be quoted as a win unless it's marked `<< improved`; five rounds is
-the floor, ten makes tighter claims.
+the floor, ten makes tighter claims. Metric direction is inferred from the
+name, and rates of bad events (`migrations_per_sec`, cache misses, faults)
+are judged lower-is-better despite the `per_sec` suffix — for this
+scheduler a migration is a cost being paid, not work being done.
 
 Comparing against other scx schedulers is one flag:
 
