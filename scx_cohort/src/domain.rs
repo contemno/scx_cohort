@@ -41,6 +41,10 @@ pub struct TaskSnapshot {
     pub cohort_id: u64,
     /// On-CPU nanoseconds this tick (delta of the monotonic runtime sum).
     pub duty_ns: u64,
+    /// False on the task's first sighting: there is no previous sample to
+    /// diff, so `duty_ns` reads 0 regardless of how hot the task is.
+    /// Spill growth must not treat that 0 as "cold".
+    pub duty_known: bool,
     /// The subset of `duty_ns` executed on the task's home LLC.
     pub home_ns: u64,
     /// Kernel comm, for rule matching.

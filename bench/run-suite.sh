@@ -392,18 +392,21 @@ for round in $(seq 1 "$ROUNDS"); do
 		done
 		stop_sched
 		if [[ -s "$dir/scheduler.monitor" ]]; then
-			awk '{
-				if (match($0, /affinity=[ ]*[0-9.]+%/)) {
-					v = substr($0, RSTART, RLENGTH)
-					gsub(/[^0-9.]/, "", v)
-					s += v; n++
+			for metric in affinity plan; do
+				awk -v key="$metric" '{
+					if (match($0, key "=[ ]*[0-9.]+%")) {
+						v = substr($0, RSTART, RLENGTH)
+						gsub(/[^0-9.]/, "", v)
+						s += v; n++
+					}
+				     }
+				     END { if (n) printf "%.1f\n", s / n }' \
+					"$dir/scheduler.monitor" | {
+					read -r a || true
+					[[ -n ${a:-} ]] && \
+						emit _scheduler "$s" "$round" "${metric}_pct" "$a"
 				}
-			     }
-			     END { if (n) printf "%.1f\n", s / n }' \
-				"$dir/scheduler.monitor" | {
-				read -r a || true
-				[[ -n ${a:-} ]] && emit _scheduler "$s" "$round" affinity_pct "$a"
-			}
+			done
 		fi
 		sleep "$COOLDOWN"
 	done

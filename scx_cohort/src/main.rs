@@ -107,7 +107,8 @@ struct Opts {
     #[clap(long, default_value = "2")]
     steal_min: u64,
 
-    /// ...or its head task has waited longer than this many microseconds.
+    /// ...and its head task has waited longer than this many microseconds.
+    /// Higher values = stickier CCDs.
     #[clap(long, default_value = "500")]
     steal_delay_us: u64,
 
@@ -535,6 +536,7 @@ impl<'a> Scheduler<'a> {
                 continue;
             };
             let pid = u32::from_ne_bytes(key.as_slice().try_into()?);
+            let duty_known = self.prev_runtime.contains_key(&pid);
             let (prev, prev_home) = self
                 .prev_runtime
                 .get(&pid)
@@ -552,6 +554,7 @@ impl<'a> Scheduler<'a> {
                 tgid: ts.tgid,
                 cohort_id: ts.cohort_id,
                 duty_ns: ts.runtime_sum.saturating_sub(prev),
+                duty_known,
                 home_ns: ts.runtime_home_sum.saturating_sub(prev_home),
                 comm: String::from_utf8_lossy(&ts.comm[..comm_len]).into_owned(),
             });
@@ -855,6 +858,15 @@ impl<'a> Scheduler<'a> {
             // Recomputed from counters (cumulatively here, per-interval in
             // Metrics::delta) — see stats::affinity_pct for the formula.
             affinity_hit_pct: stats::affinity_pct(
+                c[STAT_SYNC_LOCAL as usize]
+                    + c[STAT_PREV_IDLE as usize]
+                    + c[STAT_IDLE_CORE as usize]
+                    + c[STAT_IDLE_SMT as usize],
+                c[STAT_ENQ_HOME as usize],
+                c[STAT_ENQ_SPILL as usize],
+                c[STAT_STEAL as usize],
+            ),
+            plan_hit_pct: stats::plan_hit_pct(
                 c[STAT_SYNC_LOCAL as usize]
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
