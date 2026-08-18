@@ -113,9 +113,10 @@ struct Opts {
     steal_delay_us: u64,
 
     /// An interactive wakee may preempt its previous CPU (when that CPU
-    /// runs a non-interactive task) at most once per victim CPU per this
-    /// many microseconds. Raise to trade wakeup latency for fewer IPIs.
-    #[clap(long, default_value = "20")]
+    /// runs a firmly-batch, rarely-waking task) at most once per victim
+    /// CPU per this many microseconds. Raise to trade wakeup latency for
+    /// fewer IPIs.
+    #[clap(long, default_value = "5")]
     preempt_min_us: u64,
 
     /// Move a cohort when the inter-CCD load gap exceeds this percentage

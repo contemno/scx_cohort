@@ -39,7 +39,7 @@ struct Tunables tunables = {
 	.credit_max_ns		= 4000000,
 	.credit_wake_freq_min	= 50,
 	.credit_runtime_max_ns	= 2000000,
-	.preempt_min_ns		= 20000,
+	.preempt_min_ns		= 5000,
 	.sample_shift		= 3,
 };
 
@@ -84,8 +84,17 @@ struct {
 struct scratch_ctx {
 	struct bpf_cpumask __kptr *mask;
 	u32 sample_ctr;
-	/* The running task fits the interactive signature (set in running). */
-	u32 curr_interactive;
+	/*
+	 * The running task is firmly batch — it rarely wakes (set in
+	 * running). Only such tasks may be preempted: "not credit-
+	 * qualified" is NOT the same thing, because a task with frequent
+	 * wakes but long runs (a hackbench receiver draining a message
+	 * burst) fails the interactive test yet is a throughput carrier;
+	 * victimizing that middle class was measured as hackbench running
+	 * preemption at the rate-limiter ceiling (~800k/s) and +52%
+	 * elapsed.
+	 */
+	u32 curr_batch;
 	/* Last time enqueue preempted this CPU; rate-limits the IPIs. */
 	u64 last_preempt_ts;
 };
@@ -492,11 +501,11 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 		 * still waits out someone's slice (measured as pingpong
 		 * p50 doubling under per-CPU spinner load). Preempt the
 		 * wakee's cache-warm prev_cpu instead — but only on a real
-		 * wakeup, only if that CPU currently runs a task that is
-		 * NOT itself interactive (batch work can be displaced;
-		 * peers cannot, or all-interactive workloads like
-		 * hackbench would preempt each other on every message),
-		 * and at most once per victim CPU per preempt_min_ns.
+		 * wakeup, only if that CPU currently runs a firmly-batch
+		 * task (one that rarely wakes: a spinner or compiler, not
+		 * a frequently-waking throughput carrier — see the
+		 * curr_batch comment), and at most once per victim CPU
+		 * per preempt_min_ns.
 		 */
 		if ((enq_flags & SCX_ENQ_WAKEUP) && llcx) {
 			const struct cpumask *hmask = cast_mask(llcx->cpumask);
@@ -511,7 +520,7 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 								   &zero, prev);
 				u64 pnow = scx_bpf_now();
 
-				if (vs && !vs->curr_interactive &&
+				if (vs && vs->curr_batch &&
 				    pnow - vs->last_preempt_ts >
 					    tunables.preempt_min_ns) {
 					/* Benign cross-CPU race: worst case
@@ -623,7 +632,8 @@ void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 	/* Publish what this CPU runs, for remote preemption decisions. */
 	sctx = bpf_map_lookup_elem(&scratch_stor, &zero);
 	if (sctx)
-		sctx->curr_interactive = task_interactive(tctx);
+		sctx->curr_batch =
+			tctx->wake_freq < tunables.credit_wake_freq_min;
 }
 
 void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)

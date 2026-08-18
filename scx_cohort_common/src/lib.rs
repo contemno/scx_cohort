@@ -158,8 +158,8 @@ pub struct Tunables {
     /// Maximum average runtime for the interactive credit.
     pub credit_runtime_max_ns: u64,
     /// An interactive wakee may preempt its previous CPU (when that CPU
-    /// runs a non-interactive task) at most once per victim CPU per this
-    /// interval. Bounds the worst-case preemption IPI rate.
+    /// runs a firmly-batch, rarely-waking task) at most once per victim
+    /// CPU per this interval. Bounds the worst-case preemption IPI rate.
     pub preempt_min_ns: u64,
     /// Wake-edge recording is sampled 1-in-2^sample_shift.
     pub sample_shift: u32,
@@ -174,7 +174,7 @@ impl Default for Tunables {
             credit_max_ns: 4_000_000,
             credit_wake_freq_min: 50,
             credit_runtime_max_ns: 2_000_000,
-            preempt_min_ns: 20_000,
+            preempt_min_ns: 5_000,
             sample_shift: 3,
             _pad: 0,
         }
