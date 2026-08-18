@@ -91,7 +91,7 @@ scheduler with a restart code; the daemon re-initializes automatically
 | `--slice-us` | 5000 | Scheduling slice duration in microseconds. |
 | `--interval-ms` | 200 | Daemon tick (balancer/discovery) interval. |
 | `--steal-min` | 2 | Steal across the fabric only when the foreign queue is deeper than this… |
-| `--steal-delay-us` | 500 | …or its head task has waited this long. Higher = stickier CCDs. |
+| `--steal-delay-us` | 500 | …and its head task has waited this long. Higher = stickier CCDs. |
 | `--imbalance-pct` | 20 | Inter-CCD load gap (as % of one CCD) that triggers a cohort move. |
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |

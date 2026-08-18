@@ -38,6 +38,8 @@ pub struct Metrics {
     pub nr_tasks: u64,
     #[stat(desc = "% of placements landing on the home CCD (the headline number)")]
     pub affinity_hit_pct: f64,
+    #[stat(desc = "% of placements landing where planned, home or spill target")]
+    pub plan_hit_pct: f64,
 
     #[stat(desc = "WAKE_SYNC handoffs to a same-cohort waker's CPU")]
     pub nr_sync_local: u64,
@@ -76,10 +78,11 @@ impl Metrics {
     pub fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% moves={} merges={} splits={} execs={} spilled={}",
+            "[scx_cohort] cohorts={:<4} tasks={:<5} affinity={:5.1}% plan={:5.1}% moves={} merges={} splits={} execs={} spilled={}",
             self.nr_cohorts,
             self.nr_tasks,
             self.affinity_hit_pct,
+            self.plan_hit_pct,
             self.nr_migrations,
             self.nr_merges,
             self.nr_splits,
@@ -140,6 +143,12 @@ impl Metrics {
             d.nr_enq_spill,
             d.nr_steals,
         );
+        d.plan_hit_pct = plan_hit_pct(
+            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt,
+            d.nr_enq_home,
+            d.nr_enq_spill,
+            d.nr_steals,
+        );
         d
     }
 }
@@ -153,6 +162,22 @@ pub fn affinity_pct(direct: u64, enq_home: u64, enq_spill: u64, steals: u64) -> 
     let total = direct + enq_home + enq_spill;
     if total > 0 {
         home as f64 * 100.0 / total as f64
+    } else {
+        100.0
+    }
+}
+
+/// Placement-plan adherence: home *and* spill-target placements both
+/// count as hits — spilling is deliberate policy, not a miss — so this
+/// stays diagnostic for oversized cohorts, where `affinity_pct` is
+/// structurally capped by the share of members the plan itself runs
+/// remotely. Steals are the only misses: work that ran somewhere no
+/// plan put it.
+pub fn plan_hit_pct(direct: u64, enq_home: u64, enq_spill: u64, steals: u64) -> f64 {
+    let total = direct + enq_home + enq_spill;
+    let on_plan = total.saturating_sub(steals);
+    if total > 0 {
+        on_plan as f64 * 100.0 / total as f64
     } else {
         100.0
     }
@@ -364,6 +389,25 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn plan_hits_count_spills_where_affinity_does_not() {
+        // 40 direct + 40 home enqueues, 40 spill enqueues (an oversized
+        // cohort running a third of its placements remotely by plan),
+        // 12 steals.
+        let (direct, home, spill, steals) = (40, 40, 40, 12);
+        // Affinity charges the spilled share against the cohort even
+        // though it is deliberate: (40+40-12)/120.
+        assert!((affinity_pct(direct, home, spill, steals) - 56.666).abs() < 0.01);
+        // Plan adherence treats only steals as misses: (120-12)/120.
+        assert!((plan_hit_pct(direct, home, spill, steals) - 90.0).abs() < 0.01);
+        // With no spills the two metrics agree.
+        assert_eq!(
+            affinity_pct(direct, home, 0, steals),
+            plan_hit_pct(direct, home, 0, steals)
+        );
+        assert_eq!(plan_hit_pct(0, 0, 0, 0), 100.0);
+    }
+
+    #[test]
     fn procs_snapshot_aggregates_threads_and_affinity() {
         let tick = Duration::from_millis(200);
         let tick_ns = 200_000_000u64;
@@ -382,6 +426,7 @@ mod tests {
             tgid,
             cohort_id: 7,
             duty_ns: duty,
+            duty_known: true,
             home_ns: home,
             comm: comm.into(),
         };

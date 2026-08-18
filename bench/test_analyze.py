@@ -21,6 +21,7 @@ class TestDirection(unittest.TestCase):
             "elapsed_sec": "lower",
             "time_sec": "lower",
             "affinity_pct": "higher",
+            "plan_pct": "higher",
             "throughput_msgs_per_sec": "higher",
             "rtt_mean_ns": "lower",
             "rtt_p50_ns": "lower",

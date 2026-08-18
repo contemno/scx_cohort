@@ -235,9 +235,12 @@ pub fn plan_spills(
         // often-waking threads keep the home L3.
         let excess = home_load - high;
         let cold_ceiling = cfg.tick_ns * cfg.cold_max_pct / 100;
+        // A first-sighting task's duty reads 0 (no previous sample to
+        // diff), which would misfile arbitrarily hot tasks as the very
+        // coldest; skip them for one tick until their duty is real.
         let (mut cold, mut hot): (Vec<&TaskSnapshot>, Vec<&TaskSnapshot>) = tasks
             .iter()
-            .filter(|t| t.cohort_id == cohort.id && !already.contains(&t.pid))
+            .filter(|t| t.cohort_id == cohort.id && t.duty_known && !already.contains(&t.pid))
             .partition(|t| t.duty_ns < cold_ceiling);
         cold.sort_by_key(|t| t.duty_ns);
         hot.sort_by_key(|t| std::cmp::Reverse(t.duty_ns));
@@ -286,6 +289,7 @@ mod tests {
             tgid: pid,
             cohort_id,
             duty_ns,
+            duty_known: true,
             home_ns: 0,
             comm: String::new(),
         }
@@ -518,6 +522,29 @@ mod tests {
         );
         assert!(!out.is_empty());
         assert!(out.len() < tasks.len());
+    }
+
+    #[test]
+    fn first_sighting_tasks_are_not_spill_candidates() {
+        // Members whose duty has never been sampled read duty 0 and would
+        // otherwise sort as the coldest possible picks.
+        let llcs = [llc(0, CAP + CAP / 4, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP + CAP / 4)];
+        let mut fresh = task(1, 1, 0);
+        fresh.duty_known = false;
+        let tasks = vec![fresh, task(2, 1, CAP / 2), task(3, 1, CAP / 2)];
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
+        assert!(
+            !out.contains_key(&1),
+            "unsampled task spilled on its first sighting"
+        );
+        assert!(!out.is_empty(), "known-duty members must still spill");
     }
 
     #[test]

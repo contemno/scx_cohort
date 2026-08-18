@@ -488,8 +488,15 @@ void BPF_STRUCT_OPS(cohort_dispatch, s32 cpu, struct task_struct *prev)
 
 	/*
 	 * Own LLC is empty. Crossing the fabric is a priced decision:
-	 * steal only from an LLC whose DSQ is deep or whose head has
-	 * waited long enough that fairness beats locality. Stolen tasks
+	 * steal only from an LLC whose DSQ is deep AND whose head has
+	 * waited long enough that fairness beats locality. Both conditions
+	 * are required: depth alone is normal operation on a busy CCD, not
+	 * starvation — with depth as an alternative trigger, two near-full
+	 * CCDs trade queue heads on nearly every dispatch (measured at
+	 * ~400k cross-CCD migrations/sec on hackbench-class loads),
+	 * un-placing the load spill just placed. Wait time is the actual
+	 * signal that the victim CCD can't drain its own queue; a standing
+	 * overload is spill's job to shed, not this gate's. Stolen tasks
 	 * keep their cohort and drift home on their next wakeup.
 	 */
 	now = scx_bpf_now();
@@ -505,7 +512,7 @@ void BPF_STRUCT_OPS(cohort_dispatch, s32 cpu, struct task_struct *prev)
 		queued = scx_bpf_dsq_nr_queued(i);
 		if (queued <= 0)
 			continue;
-		if ((u64)queued > tunables.steal_min ||
+		if ((u64)queued > tunables.steal_min &&
 		    now - fx->head_enq_ts > tunables.steal_delay_ns) {
 			if (scx_bpf_dsq_move_to_local(i, 0)) {
 				fx->head_enq_ts = now;

@@ -146,7 +146,9 @@ pub struct Tunables {
     /// `dispatch` may steal from the foreign LLC only when its DSQ holds
     /// more than this many tasks...
     pub steal_min: u64,
-    /// ...or its head task has waited longer than this.
+    /// ...AND its head task has waited longer than this. Both must hold:
+    /// depth alone is normal operation on a busy CCD, and depth-triggered
+    /// stealing un-places what spill placed (see cohort_dispatch).
     pub steal_delay_ns: u64,
     /// Upper bound on the interactive vtime credit.
     pub credit_max_ns: u64,
