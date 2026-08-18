@@ -10,7 +10,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 crossbeam = "0.8"
 globset = "0.4.20"
-libbpf-rs = "=0.26.2"
+libbpf-rs = "=0.27.0"
 libc = "0.2"
 log = "0.4"
 scx_cohort_common = { path = "../scx_cohort_common" }
