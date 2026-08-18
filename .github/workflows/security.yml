@@ -29,7 +29,7 @@ jobs:
   advisory-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Run cargo audit against Cargo.lock
         run: |
           rustup update stable && rustup default stable
@@ -47,7 +47,7 @@ jobs:
   # secret-scan:
   #   runs-on: ubuntu-latest
   #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
   #       with:
   #         fetch-depth: 0  # gitleaks needs history, not just the working tree
   #     - uses: gitleaks/gitleaks-action@<SHA>  # vX.Y.Z — pin before enabling
@@ -60,7 +60,7 @@ jobs:
   #     contents: read
   #     security-events: write  # required to upload SARIF to the Security tab
   #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
   #     - uses: github/codeql-action/init@<SHA>  # vX.Y.Z — pin before enabling
   #       with:
   #         languages: rust, c-cpp
@@ -73,7 +73,7 @@ jobs:
   #     contents: read
   #     security-events: write
   #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
   #     - uses: aquasecurity/trivy-action@<SHA>  # vX.Y.Z — pin before enabling
   #       with:
   #         scan-type: fs
