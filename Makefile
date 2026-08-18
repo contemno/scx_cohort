@@ -3,7 +3,7 @@
 # instead of hand-duplicating the lists in workflow YAML. See
 # repo_standard's STANDARD.md -> "One list of checked files, not several".
 
-PY_SCRIPTS := bench/analyze.py
+PY_SCRIPTS := bench/analyze.py bench/test_analyze.py
 SH_SCRIPTS := bench/run-suite.sh scripts/install-hooks.sh scripts/next-version.sh
 
 .PHONY: lint lint-fast fmt-check lint-rust lint-scripts test
@@ -27,3 +27,4 @@ lint-scripts:
 
 test:
 	cargo test --workspace
+	python3 -m unittest discover -s bench -p 'test_*.py' -v
