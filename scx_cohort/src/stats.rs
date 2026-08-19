@@ -53,6 +53,8 @@ pub struct Metrics {
     pub nr_preempts: u64,
     #[stat(desc = "wakeups clamped into a busy home CCD")]
     pub nr_home_miss_clamp: u64,
+    #[stat(desc = "wakeups that skipped the idle ladder: home CCD had none")]
+    pub nr_idle_skips: u64,
     #[stat(desc = "enqueues into the home CCD's queue")]
     pub nr_enq_home: u64,
     #[stat(desc = "enqueues of spilled tasks onto the foreign CCD")]
@@ -93,13 +95,14 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  place: sync={} prev={} core={} smt={} preempt={} clamp={} enq={} | spill={} steal={} tctx_err={}",
+            "  place: sync={} prev={} core={} smt={} preempt={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
             self.nr_sync_local,
             self.nr_prev_idle,
             self.nr_idle_core,
             self.nr_idle_smt,
             self.nr_preempts,
             self.nr_home_miss_clamp,
+            self.nr_idle_skips,
             self.nr_enq_home,
             self.nr_enq_spill,
             self.nr_steals,
@@ -129,6 +132,7 @@ impl Metrics {
             nr_home_miss_clamp: self
                 .nr_home_miss_clamp
                 .saturating_sub(rhs.nr_home_miss_clamp),
+            nr_idle_skips: self.nr_idle_skips.saturating_sub(rhs.nr_idle_skips),
             nr_enq_home: self.nr_enq_home.saturating_sub(rhs.nr_enq_home),
             nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
             nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),

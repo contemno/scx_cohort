@@ -27,7 +27,7 @@ char _license[] SEC("license") = "GPL";
 UEI_DEFINE(uei);
 
 /* Set by userspace between open and load. */
-const volatile u64 slice_ns = 5000000ULL;
+const volatile u64 slice_ns = 2500000ULL;
 const volatile u32 nr_cpus = 1;
 const volatile u32 nr_llcs = 1;
 const volatile u32 cpu_llc_id[MAX_CPUS];
@@ -39,7 +39,7 @@ struct Tunables tunables = {
 	.credit_max_ns		= 4000000,
 	.credit_wake_freq_min	= 50,
 	.credit_runtime_max_ns	= 2000000,
-	.preempt_min_ns		= 5000,
+	.preempt_min_ns		= 200000,
 	.sample_shift		= 3,
 };
 
@@ -364,7 +364,8 @@ static u32 task_effective_llc(struct task_struct *p, struct TaskCtx *tctx)
 s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	const struct cpumask *idle_smt, *home_mask;
+	const struct cpumask *idle_smt, *idle_cpus, *home_mask;
+	bool home_has_idle;
 	struct TaskCtx *tctx;
 	struct scratch_ctx *sctx;
 	struct bpf_cpumask *scratch;
@@ -409,6 +410,38 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 				return cpu;
 			}
 		}
+	}
+
+	/*
+	 * Every step below needs an idle CPU somewhere in the home LLC, and
+	 * under load there is none. Run anyway and each wakeup pays an
+	 * SMT-mask fetch, a scratch-mask build and two pick_idle_cpu scans
+	 * purely to fail; measured at a quarter-million wasted double-scans
+	 * per second under hackbench. One intersects settles it up front.
+	 * (EEVDF spends nothing here either, via SIS_UTIL and the
+	 * has_idle_cores hint.)
+	 *
+	 * Deliberately racy: a CPU freeing up just after the test costs one
+	 * placement, never correctness. The task lands in the home DSQ and
+	 * whichever CPU went idle pulls it on its next dispatch.
+	 */
+	idle_cpus = scx_bpf_get_idle_cpumask();
+	home_has_idle = bpf_cpumask_intersects(idle_cpus, home_mask);
+	scx_bpf_put_idle_cpumask(idle_cpus);
+	if (!home_has_idle) {
+		/*
+		 * Returns here rather than joining the clamp path below: that
+		 * path picks from `scratch` (home ∩ cpus_ptr), which is only
+		 * built once the ladder is entered. home_mask alone can name a
+		 * CPU outside the task's affinity, which is fine for a hint —
+		 * the same fallback the missing-scratch case already takes —
+		 * because enqueue places the task for real.
+		 */
+		stat_inc(STAT_IDLE_SKIP);
+		stat_inc(STAT_HOME_MISS_CLAMP);
+		if (prev_in_home)
+			return prev_cpu;
+		return (s32)bpf_cpumask_any_distribute(home_mask);
 	}
 
 	/*
