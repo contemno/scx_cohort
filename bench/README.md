@@ -20,6 +20,13 @@ third explains *why* the first two moved.
    (`sched:sched_migrate_task`, `perf c2c` remote-HITM counts). Measured
    identically under both schedulers by tools that know nothing about
    either.
+   Read `cross_ccd_migrations_per_sec`, not `migrations_per_sec`. A raw
+   migration count says nothing about this design: hopping between two
+   cores of one CCD is cheap and crossing the fabric is the cost the
+   scheduler exists to avoid, and the two schedulers do not even pay the
+   same price per counted event. A run can migrate far *more* in total
+   while crossing CCDs far less, which is a win the raw counter reports
+   as a regression.
 3. **scx_cohort's own telemetry.** The affinity hit rate from `--stats` /
    `scx_cohort top`. This is *diagnostic*, not proof — it shows the
    mechanism engaged (placements landing on the home CCD), but only tiers
@@ -43,9 +50,17 @@ python3 bench/analyze.py bench/results/<timestamp>/results.csv
 `run-suite.sh` alternates schedulers in ABBA order across rounds (so
 thermal and background drift cancel instead of biasing whichever side runs
 second), pins the cpufreq governor to `performance`, snapshots the system
-configuration into `sysinfo.txt`, wraps every run in
-`perf stat -e sched:sched_migrate_task` when perf is available, and
-records scx_cohort's achieved affinity per run. Raw logs for every run are
+configuration into `sysinfo.txt`, counts migrations around every run, and
+records scx_cohort's achieved affinity per run.
+
+Migration counting prefers `bpftrace`, which bins each
+`sched:sched_migrate_task` by whether it stayed inside one last-level
+cache and emits `same_ccd_migrations_per_sec` and
+`cross_ccd_migrations_per_sec` alongside the total. The CPU-to-LLC map is
+read from sysfs at startup, so nothing about the topology is hardcoded and
+the generated program is dry-run before the suite starts. Without root or
+bpftrace the harness falls back to `perf stat` for the total alone and
+logs a SKIP; `sysinfo.txt` records which source produced the numbers. Raw logs for every run are
 kept under `bench/results/<timestamp>/` so any number in the CSV can be
 traced back to the output that produced it.
 
@@ -67,21 +82,60 @@ sudo bench/run-suite.sh --sched lavd=/usr/bin/scx_lavd \
 
 ## The built-in workloads
 
-- **`pingpong` / `pingpong_loaded`** (the `ipc_pingpong` workspace crate,
-  built by the same `cargo build --release` as the scheduler) — the thesis
-  test.
+- **`pingpong` family** (the `ipc_pingpong` workspace crate, built by the
+  same `cargo build --release` as the scheduler) — the thesis test.
   Pairs of processes exchange messages through shared memory with futex
   wakeups, and every message walks the buffer cache line by cache line, so
   line ownership ping-pongs between the processes exactly like Chrome's
   Mojo rings or Wine's fsync-guarded state. Same CCD: lines move through
   the shared L3. Split across CCDs: every line crosses the Infinity
-  Fabric (~75–85 ns per hop on Zen 4/5 vs ~15–30 ns in-L3). The `_loaded`
-  variant adds one busy-loop process per CPU, which is what provokes
-  EEVDF's machine-wide balancing into separating communicating pairs —
-  expect the interesting deltas in `rtt_p99_ns`/`rtt_p999_ns` there, on an
+  Fabric (~75–85 ns per hop on Zen 4/5 vs ~15–30 ns in-L3).
+
+  | variant | duty cycle | background load | what it measures |
+  |---|---|---|---|
+  | `pingpong` | flat out | none | wake-affine placement on an idle machine |
+  | `pingpong_loaded` | flat out | one exec'd spinner per CPU | placement under saturation |
+  | `pingpong_real` | 50 µs think, 1 MiB scratch | one exec'd spinner per CPU | **the number to quote** |
+  | `pingpong_spill` | flat out | one *forked* spinner per CPU | the oversized-cohort spill path |
+
+  `pingpong_real` is the honest one, for two reasons the others get wrong.
+  A pair that round-trips flat out never yields, and its 4 KiB payload
+  never leaves L1, so the measurement is coherence traffic on hot lines
+  rather than the L3-versus-fabric distinction this design targets. `-t`
+  gives the pair work to do between messages and `-S` dirties a private
+  scratch buffer larger than L2, which evicts the shared payload down to
+  L3 where the CCD boundary starts to cost something. Think time is
+  excluded from the measured RTT and included in throughput, so RTT stays
+  comparable across variants while throughput drops to the slower cadence.
+
+  `pingpong_spill` exists to keep an artifact visible rather than
+  accidental. Its loaders are plain forks, so on a scheduler that groups
+  by fork lineage they inherit the pairs' cohort, and the run oversubscribes
+  a single cohort to roughly 5x one CCD. That measures spill behavior, not
+  placement. Everywhere else the loaders `exec` themselves, which is a
+  program-identity boundary (scx_cohort severs lineage there), so they
+  compete from their own group the way a real background job does.
+
+  Interesting deltas live in `rtt_p99_ns`/`rtt_p999_ns` under load; on an
   idle machine wake-affine heuristics often keep pairs together fine.
+
+  Two confounds to separate before quoting a win. Under saturation a tail
+  measured in milliseconds against a microsecond median is queueing delay,
+  not fabric latency, and scx_cohort's interactive preemption attacks it
+  directly — so rerun with `--preempt-min-us` set high enough to disable
+  preemption and see how much of the win survives as placement. And check
+  `cross_ccd_migrations_per_sec` rather than the raw total, which is
+  dominated by cheap same-CCD hops.
 - **schbench** — wakeup-latency percentiles under scheduler saturation;
   the standard "did tail latency regress" check.
+- **`schbench_loaded`** — the same wakeup percentiles measured *while*
+  hackbench saturates the machine. This is the interactive-under-load
+  case the whole design exists for, and the only workload here that puts
+  a number on it: everything else measures throughput or latency alone.
+  Read `wakeup_p99_usec` and `wakeup_p999_usec`; a desktop that stalls
+  under a kernel build shows up here and nowhere else. Worth running
+  across a slice sweep rather than once, because `--slice-us` turned out
+  to dominate this metric (see DESIGN.md §4.2).
 - **hackbench** (or `perf bench sched messaging`) — messaging throughput.
   This is a *parity* check: cohort should be within a few percent, and a
   big win here would itself be suspicious.
@@ -138,8 +192,16 @@ to the Speedometer number.
 
 When a delta shows up (or refuses to), these attribute the cause:
 
+- `sudo bpftrace -e 'tracepoint:sched:sched_migrate_task {
+  @[(((args->orig_cpu % 16) >= 8) == ((args->dest_cpu % 16) >= 8)) ?
+  "same-ccd" : "CROSS-CCD"] = count(); }'` — same-versus-cross-CCD
+  migrations during real desktop use, where no repeatable workload exists.
+  Verify the CCD split for your part first with
+  `cat /sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list`; add a
+  `/comm == "chrome"/` filter to scope it. The harness records the same
+  breakdown per run.
 - `perf stat -a -e sched:sched_migrate_task -- <workload>` — migration
-  rate (the harness already records this per run).
+  rate, total only (the harness falls back to this without bpftrace).
 - `sudo perf c2c record -a -- sleep 10; sudo perf c2c report` during a
   workload — remote-HITM counts are the direct measurement of cache lines
   bouncing across the fabric; this is the counter the whole design exists
@@ -167,9 +229,17 @@ Every published comparison should be able to answer yes to all of these:
   frame caps off, 120 s+ captures (a 0.1% low needs thousands of frames
   to be more than one hiccup).
 
-Two honest caveats to keep in mind when reading results: the daemon
+Three honest caveats to keep in mind when reading results: the daemon
 itself costs a little CPU (it shows up in hackbench-class benchmarks as
-part of cohort's side, which is fair — users pay it too), and
-`pingpong_loaded`'s spinners are also being scheduled by the scheduler
-under test, so it measures the whole system's behavior, not the pairs in
-isolation. That's the point.
+part of cohort's side, which is fair — users pay it too), the loaded
+variants' spinners are also being scheduled by the scheduler under test,
+so they measure the whole system's behavior rather than the pairs in
+isolation (that's the point), and the bpftrace classifier adds a map
+update per migration, which both schedulers pay equally but which is not
+free on hackbench-class migration rates. `--no-ccd` drops back to
+`perf stat` if you need the lighter instrument.
+
+Results predating the exec'd loaders are not comparable to results after
+them. `pingpong_loaded` used forked spinners, which on scx_cohort joined
+the cohort under measurement; those runs are what `pingpong_spill` now
+reproduces deliberately.

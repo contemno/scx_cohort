@@ -34,6 +34,10 @@ from itertools import combinations
 # wins via the "per_sec"/"ops" suffixes ("migrations_per_sec" is a cost,
 # not a throughput). Metrics not matched anywhere are printed without a
 # verdict arrow.
+# Diagnostic context rather than a target, checked ahead of everything
+# else: a scheduler that converts fabric crossings into cheap in-CCD hops
+# should push same-CCD migrations *up*, so neither direction is a verdict.
+NEUTRAL = ("same_ccd_migrations",)
 BAD_EVENT = ("migrations", "misses", "faults", "drops", "stalls")
 HIGHER_BETTER = ("per_sec", "fps", "pct", "throughput", "ops", "score", "rps")
 LOWER_BETTER = ("_ns", "_us", "_usec", "_ms", "_sec", "latency", "time",
@@ -42,6 +46,8 @@ LOWER_BETTER = ("_ns", "_us", "_usec", "_ms", "_sec", "latency", "time",
 
 def direction(metric: str):
     m = metric.lower()
+    if any(k in m for k in NEUTRAL):
+        return None
     if any(k in m for k in BAD_EVENT):
         return "lower"
     if any(k in m for k in HIGHER_BETTER):

@@ -49,6 +49,8 @@ pub struct OptionsTable {
     pub steal_min: Option<u64>,
     /// Steal gate: maximum head wait in microseconds.
     pub steal_delay_us: Option<u64>,
+    /// Wakeup preemption: minimum interval per victim CPU, microseconds.
+    pub preempt_min_us: Option<u64>,
     /// Balancer imbalance threshold, % of one CCD's capacity.
     pub imbalance_pct: Option<u64>,
     /// Post-move cohort immunity in milliseconds.
