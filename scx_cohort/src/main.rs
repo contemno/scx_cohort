@@ -71,8 +71,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
 use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
-    CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, MAX_CPUS,
-    MAX_LLCS, NR_STATS,
+    CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, DEFAULT_SLICE_NS,
+    MAX_CPUS, MAX_LLCS, NR_STATS,
 };
 use wake_graph::{WakeGraph, WakeGraphCfg};
 
@@ -94,8 +94,11 @@ const BATCH: u32 = 512;
 #[derive(Debug, Parser)]
 #[command(version)]
 struct Opts {
-    /// Scheduling slice duration in microseconds.
-    #[clap(long, default_value = "5000")]
+    /// Scheduling slice duration in microseconds. The dominant knob for
+    /// interactive responsiveness under fork-heavy load: a wakee waits out
+    /// the slices queued ahead of it, so 5000 stalled the desktop for
+    /// seconds under hackbench where 2500 does not.
+    #[clap(long, default_value_t = DEFAULT_SLICE_NS / 1000)]
     slice_us: u64,
 
     /// Daemon tick interval in milliseconds.
@@ -111,6 +114,16 @@ struct Opts {
     /// Higher values = stickier CCDs.
     #[clap(long, default_value = "500")]
     steal_delay_us: u64,
+
+    /// An interactive wakee may preempt its previous CPU (when that CPU
+    /// runs a firmly-batch, rarely-waking task) at most once per victim
+    /// CPU per this many microseconds. Raise to trade wakeup latency for
+    /// fewer IPIs. At 5 the path is effectively unthrottled and, under
+    /// fork-heavy load where almost nothing qualifies as a victim, the
+    /// attempts are near-pure overhead: measured at ~200k/s while the
+    /// desktop stalled anyway.
+    #[clap(long, default_value = "200")]
+    preempt_min_us: u64,
 
     /// Move a cohort when the inter-CCD load gap exceeds this percentage
     /// of one CCD's capacity for two consecutive ticks.
@@ -175,11 +188,16 @@ enum Command {
 
 impl Opts {
     fn tunables(&self) -> Tunables {
-        Tunables {
+        let mut t = Tunables {
             steal_min: self.steal_min,
             steal_delay_ns: self.steal_delay_us * 1000,
+            preempt_min_ns: self.preempt_min_us * 1000,
             ..Tunables::default()
-        }
+        };
+        // The interactive knobs are ratios of a slice stored as absolutes;
+        // a short slice inverts their meaning if they aren't rescaled.
+        t.scale_to_slice(self.slice_us * 1000);
+        t
     }
 }
 
@@ -313,10 +331,24 @@ impl<'a> Scheduler<'a> {
             let data = skel.maps.data_data.as_mut().unwrap();
             data.tunables.steal_min = t.steal_min;
             data.tunables.steal_delay_ns = t.steal_delay_ns;
+            data.tunables.preempt_min_ns = t.preempt_min_ns;
             data.tunables.credit_max_ns = t.credit_max_ns;
             data.tunables.credit_wake_freq_min = t.credit_wake_freq_min;
             data.tunables.credit_runtime_max_ns = t.credit_runtime_max_ns;
             data.tunables.sample_shift = t.sample_shift;
+
+            let base = Tunables::default();
+            if t.credit_max_ns != base.credit_max_ns
+                || t.credit_runtime_max_ns != base.credit_runtime_max_ns
+            {
+                info!(
+                    "slice {} us: interactive credit scaled to {} us, \
+                     brief-run ceiling to {} us",
+                    opts.slice_us,
+                    t.credit_max_ns / 1000,
+                    t.credit_runtime_max_ns / 1000
+                );
+            }
         }
 
         let llc_cpus: BTreeMap<u32, u64> = topo
@@ -345,6 +377,7 @@ impl<'a> Scheduler<'a> {
                 imbalance_pct: opts.imbalance_pct,
                 confirm_ticks: 2,
                 residency_ms: opts.residency_ms,
+                ..BalancerCfg::default()
             }),
             llc_cpus,
             prev_load_sum: HashMap::new(),
@@ -861,7 +894,8 @@ impl<'a> Scheduler<'a> {
                 c[STAT_SYNC_LOCAL as usize]
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
-                    + c[STAT_IDLE_SMT as usize],
+                    + c[STAT_IDLE_SMT as usize]
+                    + c[STAT_PREEMPT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
@@ -870,16 +904,19 @@ impl<'a> Scheduler<'a> {
                 c[STAT_SYNC_LOCAL as usize]
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
-                    + c[STAT_IDLE_SMT as usize],
+                    + c[STAT_IDLE_SMT as usize]
+                    + c[STAT_PREEMPT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
             ),
+            nr_preempts: c[STAT_PREEMPT as usize],
             nr_sync_local: c[STAT_SYNC_LOCAL as usize],
             nr_prev_idle: c[STAT_PREV_IDLE as usize],
             nr_idle_core: c[STAT_IDLE_CORE as usize],
             nr_idle_smt: c[STAT_IDLE_SMT as usize],
             nr_home_miss_clamp: c[STAT_HOME_MISS_CLAMP as usize],
+            nr_idle_skips: c[STAT_IDLE_SKIP as usize],
             nr_enq_home: c[STAT_ENQ_HOME as usize],
             nr_enq_spill: c[STAT_ENQ_SPILL as usize],
             nr_steals: c[STAT_STEAL as usize],
@@ -1065,6 +1102,7 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     apply!(interval_ms);
     apply!(steal_min);
     apply!(steal_delay_us);
+    apply!(preempt_min_us);
     apply!(imbalance_pct);
     apply!(residency_ms);
     apply!(merge_wakes_per_sec);

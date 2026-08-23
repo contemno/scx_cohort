@@ -88,10 +88,11 @@ scheduler with a restart code; the daemon re-initializes automatically
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--slice-us` | 5000 | Scheduling slice duration in microseconds. |
+| `--slice-us` | 2500 | Scheduling slice duration in microseconds. The dominant knob for responsiveness under fork-heavy load, since a wakee waits out whatever slices are queued ahead of it. The interactive credit knobs are ratios of a slice, so lowering this scales them down to match; raising it leaves them at their defaults. |
 | `--interval-ms` | 200 | Daemon tick (balancer/discovery) interval. |
 | `--steal-min` | 2 | Steal across the fabric only when the foreign queue is deeper than this… |
 | `--steal-delay-us` | 500 | …and its head task has waited this long. Higher = stickier CCDs. |
+| `--preempt-min-us` | 200 | An interactive wakee preempts its prev CPU (if running rarely-waking batch work) at most this often per CPU. Lower values are near-free on spinner-style load and near-pure overhead on fork-heavy load, where nothing qualifies as a victim. |
 | `--imbalance-pct` | 20 | Inter-CCD load gap (as % of one CCD) that triggers a cohort move. |
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |
@@ -112,10 +113,11 @@ built-in defaults < `[options]` < explicitly passed CLI flags.
 
 ```toml
 [options]
-slice_us = 5000
+slice_us = 2500
 interval_ms = 200
 steal_min = 2
 steal_delay_us = 500
+preempt_min_us = 200
 imbalance_pct = 20
 residency_ms = 2000
 merge_wakes_per_sec = 300.0

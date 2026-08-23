@@ -3,14 +3,18 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
-//! The load balancer: decides which whole cohort, if any, changes home
+//! The load balancer: decides which whole cohorts, if any, change home
 //! LLC this tick. Pure logic over [`crate::domain`] snapshots.
 //!
 //! Stability rules, per DESIGN.md §4.3: whole cohorts move (never split to
 //! fix a number), imbalance must persist for `confirm_ticks` consecutive
 //! ticks before anything moves, a cohort that just moved is immune for
 //! `residency_ms`, and a cohort too big for one LLC is never relocated
-//! (spill handles it instead).
+//! (spill handles it instead). A tick may move up to
+//! `max_moves_per_tick` cohorts: the confirmation gate still decides
+//! whether *any* move happens, but a split hands several cohorts one home
+//! at once and unwinding that a cohort at a time is too slow to be
+//! useful.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +29,13 @@ pub struct BalancerCfg {
     pub confirm_ticks: u32,
     /// A cohort that moved is immune from moving again for this long.
     pub residency_ms: u64,
+    /// Most cohorts relocated in one tick. Splits give every new cohort
+    /// the parent's home, so a one-per-tick ceiling (with two-tick
+    /// confirmation, one move per 400 ms) needed seconds to unwind a
+    /// seven-way split, and left one LLC saturated while the other idled
+    /// for the duration. Moves are lazy — members drift over on their
+    /// next wakeup — so a bounded batch costs far less than that stall.
+    pub max_moves_per_tick: usize,
 }
 
 impl Default for BalancerCfg {
@@ -33,6 +44,7 @@ impl Default for BalancerCfg {
             imbalance_pct: 20,
             confirm_ticks: 2,
             residency_ms: 2000,
+            max_moves_per_tick: 8,
         }
     }
 }
@@ -71,10 +83,9 @@ impl Balancer {
 
         let max = llcs.iter().max_by_key(|l| l.load_ns).unwrap();
         let min = llcs.iter().min_by_key(|l| l.load_ns).unwrap();
-        let gap = max.load_ns - min.load_ns;
         let threshold = min.capacity_ns * self.cfg.imbalance_pct / 100;
 
-        if gap <= threshold {
+        if max.load_ns - min.load_ns <= threshold {
             self.streak = 0;
             return vec![];
         }
@@ -83,44 +94,81 @@ impl Balancer {
             return vec![];
         }
 
-        // Candidates live on the loaded side, are movable, and are small
-        // enough that one LLC can hold them (oversized cohorts are spill's
-        // problem, not relocation's).
-        let best = cohorts
+        // Projected (llc, load, capacity) in `llcs` order — same order, so
+        // ties break exactly as they did when this planned one move. Each
+        // pick is applied to the projection before the next, so a batch
+        // converges on the balance point instead of every member of it
+        // chasing the same stale gap and overshooting into a mirror
+        // imbalance.
+        let mut proj: Vec<(u32, u64, u64)> = llcs
             .iter()
-            .filter(|c| {
-                c.home_llc == max.llc
-                    && !c.pinned
-                    && c.nr_tasks > 0
-                    && c.load_ns > 0
-                    && c.load_ns <= min.capacity_ns
-                    && self.last_move_at.get(&c.id).is_none_or(|at| {
-                        now_ms.saturating_sub(*at)
-                            >= c.residency_ms.unwrap_or(self.cfg.residency_ms)
-                    })
-            })
-            // Moving c changes the gap to |gap - 2*load|; pick the cohort
-            // that repairs it best, and among equals the smaller one (less
-            // cache state to re-warm on the other CCD).
-            .filter(|c| (gap as i64 - 2 * c.load_ns as i64).unsigned_abs() < gap)
-            .min_by_key(|c| {
-                (
-                    (gap as i64 - 2 * c.load_ns as i64).unsigned_abs(),
-                    c.load_ns,
-                )
+            .map(|l| (l.llc, l.load_ns, l.capacity_ns))
+            .collect();
+        let mut chosen: HashSet<u64> = HashSet::new();
+        let mut out = Vec::new();
+
+        while out.len() < self.cfg.max_moves_per_tick {
+            let (hi_llc, hi_load, _) = *proj.iter().max_by_key(|(_, load, _)| *load).unwrap();
+            let (lo_llc, lo_load, lo_cap) = *proj.iter().min_by_key(|(_, load, _)| *load).unwrap();
+            let gap = hi_load - lo_load;
+            if gap <= lo_cap * self.cfg.imbalance_pct / 100 {
+                break;
+            }
+
+            // Candidates live on the loaded side, are movable, are small
+            // enough that one LLC can hold them (oversized cohorts are
+            // spill's problem, not relocation's), and have not already
+            // been picked earlier in this same batch.
+            let best = cohorts
+                .iter()
+                .filter(|c| {
+                    c.home_llc == hi_llc
+                        && !c.pinned
+                        && c.nr_tasks > 0
+                        && c.load_ns > 0
+                        && c.load_ns <= lo_cap
+                        && !chosen.contains(&c.id)
+                        && self.last_move_at.get(&c.id).is_none_or(|at| {
+                            now_ms.saturating_sub(*at)
+                                >= c.residency_ms.unwrap_or(self.cfg.residency_ms)
+                        })
+                })
+                // Moving c changes the gap to |gap - 2*load|; pick the
+                // cohort that repairs it best, and among equals the
+                // smaller one (less cache state to re-warm on the other
+                // CCD).
+                .filter(|c| (gap as i64 - 2 * c.load_ns as i64).unsigned_abs() < gap)
+                .min_by_key(|c| {
+                    (
+                        (gap as i64 - 2 * c.load_ns as i64).unsigned_abs(),
+                        c.load_ns,
+                    )
+                });
+
+            let Some(c) = best else {
+                break;
+            };
+
+            chosen.insert(c.id);
+            self.last_move_at.insert(c.id, now_ms);
+            out.push(Decision::MoveCohort {
+                id: c.id,
+                to: lo_llc,
             });
 
-        match best {
-            Some(c) => {
-                self.last_move_at.insert(c.id, now_ms);
-                self.streak = 0;
-                vec![Decision::MoveCohort {
-                    id: c.id,
-                    to: min.llc,
-                }]
+            for e in proj.iter_mut() {
+                if e.0 == hi_llc {
+                    e.1 = e.1.saturating_sub(c.load_ns);
+                } else if e.0 == lo_llc {
+                    e.1 += c.load_ns;
+                }
             }
-            None => vec![],
         }
+
+        if !out.is_empty() {
+            self.streak = 0;
+        }
+        out
     }
 }
 
@@ -129,7 +177,10 @@ impl Balancer {
 /// hottest CPU-bound members are exiled too, until home demand fits.
 /// Selection is sticky — already-spilled tasks stay chosen while the
 /// overload lasts, so the *same* threads stay remote instead of the whole
-/// cohort churning across the boundary.
+/// cohort churning across the boundary. Growth is bounded by what the
+/// destination can absorb, and members that burned nothing are never
+/// exiled: together those keep an oversized cohort from emptying its home
+/// into an already-saturated neighbour.
 #[derive(Debug, Clone)]
 pub struct SpillCfg {
     /// A cohort spills when its load exceeds this percentage of its home
@@ -180,6 +231,10 @@ pub fn plan_spills(
         return desired;
     }
     let capacity: HashMap<u32, u64> = llcs.iter().map(|l| (l.llc, l.capacity_ns)).collect();
+    // Load this pass has already promised to each destination, so
+    // several oversized cohorts spilling in one tick cannot each claim
+    // the same headroom and collectively flood it.
+    let mut planned: HashMap<u32, u64> = HashMap::new();
 
     for cohort in cohorts {
         let Some(&cap) = capacity.get(&cohort.home_llc) else {
@@ -201,14 +256,6 @@ pub fn plan_spills(
             continue;
         }
 
-        // The least-loaded other LLC absorbs the spill.
-        let target = llcs
-            .iter()
-            .filter(|l| l.llc != cohort.home_llc)
-            .min_by_key(|l| l.load_ns)
-            .map(|l| l.llc)
-            .unwrap();
-
         for pid in &already {
             desired.insert(*pid, *current.get(pid).unwrap());
         }
@@ -228,12 +275,35 @@ pub fn plan_spills(
             continue;
         }
 
+        // Only an LLC with room absorbs the spill. Exiling into one
+        // already past its own high mark trades a crowded home for a
+        // crowded exile, and on a two-CCD part there is no third choice,
+        // so an unchecked destination drains one side into the other
+        // until half the machine idles behind a saturated queue. Measured
+        // under hackbench as affinity falling to 7.5%, one LLC at 9% while
+        // the other held above 100%. When nowhere has room the existing
+        // set still stands; it just doesn't grow.
+        let Some(dest) = llcs
+            .iter()
+            .filter(|l| l.llc != cohort.home_llc)
+            .min_by_key(|l| l.load_ns + planned.get(&l.llc).copied().unwrap_or(0))
+        else {
+            continue;
+        };
+        let dest_load = dest.load_ns + planned.get(&dest.llc).copied().unwrap_or(0);
+        let headroom = (dest.capacity_ns * cfg.high_pct / 100).saturating_sub(dest_load);
+        if headroom == 0 {
+            continue;
+        }
+        let target = dest.llc;
+
         // Grow the set until the remaining home demand fits under the
         // high mark: cold members first (coldest-first, near-zero cost to
         // run remotely), then — if the cold candidates run out — hot
         // members, hottest-first, so CPU-bound hogs are exiled and the
-        // often-waking threads keep the home L3.
-        let excess = home_load - high;
+        // often-waking threads keep the home L3. Never promise the
+        // destination more than it can hold.
+        let excess = (home_load - high).min(headroom);
         let cold_ceiling = cfg.tick_ns * cfg.cold_max_pct / 100;
         // A first-sighting task's duty reads 0 (no previous sample to
         // diff), which would misfile arbitrarily hot tasks as the very
@@ -250,12 +320,21 @@ pub fn plan_spills(
             if shed >= excess {
                 break;
             }
+            // A member that burned nothing this tick sheds nothing by
+            // leaving: exiling it cannot close the excess, and it still
+            // pays the full price of a cold home L3 the moment it wakes.
+            // An earlier revision credited these a nominal 1 ns apiece so
+            // the loop was guaranteed to make progress, which meant a
+            // cohort of mostly-idle members handed over every one of them
+            // before a single hot thread moved. That is how one CCD came
+            // to hold an entire cohort while the other emptied.
+            if t.duty_ns == 0 {
+                continue;
+            }
             desired.insert(t.pid, target);
-            // A fully idle member sheds nothing but is still the right
-            // first pick (zero cost to run remotely); count it minimally
-            // so the loop terminates against a hot remainder.
-            shed += t.duty_ns.max(1);
+            shed += t.duty_ns;
         }
+        *planned.entry(target).or_default() += shed;
     }
     desired
 }
@@ -352,6 +431,55 @@ mod tests {
             b.plan(200, &llcs, &cohorts),
             vec![Decision::MoveCohort { id: 2, to: 1 }]
         );
+    }
+
+    #[test]
+    fn a_batch_converges_on_the_balance_point() {
+        // Seven cohorts sharing one home is what a split leaves behind:
+        // every new cohort inherits the parent's LLC. Unwinding that one
+        // move per 400 ms took seconds, long enough to stall the desktop.
+        let mut b = Balancer::new(BalancerCfg::default());
+        let each = CAP / 10;
+        let cohorts: Vec<_> = (1..=7).map(|id| cohort(id, 0, each)).collect();
+        let llcs = [llc(0, each * 7, CAP), llc(1, 0, CAP)];
+        b.plan(0, &llcs, &cohorts);
+        let moves = b.plan(200, &llcs, &cohorts);
+
+        assert!(moves.len() > 1, "batch moved only {}", moves.len());
+        let ids: HashSet<u64> = moves
+            .iter()
+            .map(|d| {
+                let Decision::MoveCohort { id, .. } = d;
+                *id
+            })
+            .collect();
+        assert_eq!(ids.len(), moves.len(), "a cohort moved twice in one batch");
+        for d in &moves {
+            let Decision::MoveCohort { to, .. } = d;
+            assert_eq!(*to, 1);
+        }
+
+        // Land inside the threshold without overshooting into a mirrored
+        // imbalance: that is what planning against the projection buys.
+        let shifted = moves.len() as u64 * each;
+        let gap = (each * 7 - shifted).abs_diff(shifted);
+        assert!(
+            gap <= CAP * 20 / 100,
+            "batch left a gap of {gap} above the threshold"
+        );
+    }
+
+    #[test]
+    fn a_batch_respects_the_cap() {
+        let mut b = Balancer::new(BalancerCfg {
+            max_moves_per_tick: 2,
+            ..BalancerCfg::default()
+        });
+        let each = CAP / 20;
+        let cohorts: Vec<_> = (1..=16).map(|id| cohort(id, 0, each)).collect();
+        let llcs = [llc(0, each * 16, CAP), llc(1, 0, CAP)];
+        b.plan(0, &llcs, &cohorts);
+        assert_eq!(b.plan(200, &llcs, &cohorts).len(), 2);
     }
 
     #[test]
@@ -545,6 +673,81 @@ mod tests {
             "unsampled task spilled on its first sighting"
         );
         assert!(!out.is_empty(), "known-duty members must still spill");
+    }
+
+    #[test]
+    fn idle_members_are_never_exiled() {
+        // The production failure: a cohort whose members are nearly all
+        // idle. Crediting each one 1 ns of progress against an excess
+        // measured in hundreds of millions handed the whole cohort to the
+        // other CCD, draining one LLC to single-digit utilisation while
+        // the other held above 100%.
+        let mut tasks = vec![task(1, 1, CAP / 3), task(2, 1, CAP / 3)];
+        for pid in 100..400 {
+            tasks.push(task(pid, 1, 0));
+        }
+        let llcs = [llc(0, CAP + CAP / 4, CAP), llc(1, 0, CAP)];
+        let cohorts = [cohort(1, 0, CAP + CAP / 4)];
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
+
+        assert!(!out.is_empty(), "duty-carrying members must still shed");
+        for pid in 100..400 {
+            assert!(!out.contains_key(&pid), "idle member {pid} was exiled");
+        }
+        assert!(
+            out.len() <= 2,
+            "only duty-carrying members spill, got {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn a_full_destination_blocks_growth_but_keeps_the_existing_set() {
+        // Both LLCs past their high mark: there is nowhere better to put
+        // anything, so the set holds instead of pushing more across.
+        let llcs = [llc(0, CAP, CAP), llc(1, CAP, CAP)];
+        let cohorts = [cohort(1, 0, CAP)];
+        let tasks = vec![
+            task(1, 1, CAP / 3),
+            task(2, 1, CAP / 3),
+            task(10, 1, CAP / 50),
+        ];
+        let current: HashMap<u32, u32> = [(10, 1)].into();
+        let out = plan_spills(&SpillCfg::default(), &llcs, &cohorts, &tasks, &current);
+        assert_eq!(out, current, "grew the spill set into a full LLC");
+    }
+
+    #[test]
+    fn concurrent_spills_share_one_destination_budget() {
+        // Two oversized cohorts spilling in the same tick must not each
+        // claim the destination's full headroom.
+        let tick = CAP / 8;
+        let mut tasks: Vec<_> = (1..=8).map(|pid| task(pid, 1, tick)).collect();
+        tasks.extend((11..=18).map(|pid| task(pid, 2, tick)));
+        // LLC 1 is at 90% of capacity: room for a little, not for both.
+        let llcs = [llc(0, CAP * 2, CAP), llc(1, CAP * 9 / 10, CAP)];
+        let cohorts = [cohort(1, 0, CAP), cohort(2, 0, CAP)];
+        let out = plan_spills(
+            &SpillCfg::default(),
+            &llcs,
+            &cohorts,
+            &tasks,
+            &HashMap::new(),
+        );
+
+        let first: Vec<u32> = (1..=8).filter(|p| out.contains_key(p)).collect();
+        let second: Vec<u32> = (11..=18).filter(|p| out.contains_key(p)).collect();
+        assert!(!first.is_empty(), "the first cohort takes the headroom");
+        assert!(
+            second.is_empty(),
+            "second cohort claimed headroom already spent: {second:?}"
+        );
     }
 
     #[test]

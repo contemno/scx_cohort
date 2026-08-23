@@ -28,6 +28,11 @@ class TestDirection(unittest.TestCase):
             "rtt_p90_ns": "lower",
             "rtt_p99_ns": "lower",
             "rtt_p999_ns": "lower",
+            # Fabric crossings are the cost this scheduler targets; the
+            # raw total is dominated by cheap in-CCD hops, and same-CCD
+            # hops are context that no arrow should judge.
+            "cross_ccd_migrations_per_sec": "lower",
+            "same_ccd_migrations_per_sec": None,
             "rtt_max_ns": "lower",
             # The regression this file exists for: a rate of a bad event
             # is a cost, even though it ends in "per_sec".

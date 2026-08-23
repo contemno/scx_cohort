@@ -49,8 +49,12 @@ pub struct Metrics {
     pub nr_idle_core: u64,
     #[stat(desc = "placements on an idle SMT sibling in the home CCD")]
     pub nr_idle_smt: u64,
+    #[stat(desc = "interactive wakeups preempting a batch task on prev_cpu")]
+    pub nr_preempts: u64,
     #[stat(desc = "wakeups clamped into a busy home CCD")]
     pub nr_home_miss_clamp: u64,
+    #[stat(desc = "wakeups that skipped the idle ladder: home CCD had none")]
+    pub nr_idle_skips: u64,
     #[stat(desc = "enqueues into the home CCD's queue")]
     pub nr_enq_home: u64,
     #[stat(desc = "enqueues of spilled tasks onto the foreign CCD")]
@@ -91,12 +95,14 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  place: sync={} prev={} core={} smt={} clamp={} enq={} | spill={} steal={} tctx_err={}",
+            "  place: sync={} prev={} core={} smt={} preempt={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
             self.nr_sync_local,
             self.nr_prev_idle,
             self.nr_idle_core,
             self.nr_idle_smt,
+            self.nr_preempts,
             self.nr_home_miss_clamp,
+            self.nr_idle_skips,
             self.nr_enq_home,
             self.nr_enq_spill,
             self.nr_steals,
@@ -122,9 +128,11 @@ impl Metrics {
             nr_prev_idle: self.nr_prev_idle.saturating_sub(rhs.nr_prev_idle),
             nr_idle_core: self.nr_idle_core.saturating_sub(rhs.nr_idle_core),
             nr_idle_smt: self.nr_idle_smt.saturating_sub(rhs.nr_idle_smt),
+            nr_preempts: self.nr_preempts.saturating_sub(rhs.nr_preempts),
             nr_home_miss_clamp: self
                 .nr_home_miss_clamp
                 .saturating_sub(rhs.nr_home_miss_clamp),
+            nr_idle_skips: self.nr_idle_skips.saturating_sub(rhs.nr_idle_skips),
             nr_enq_home: self.nr_enq_home.saturating_sub(rhs.nr_enq_home),
             nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
             nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),
@@ -138,13 +146,13 @@ impl Metrics {
         // Affinity over THIS interval, not since attach — a cumulative
         // percentage would bury fresh regressions under old history.
         d.affinity_hit_pct = affinity_pct(
-            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt,
+            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt + d.nr_preempts,
             d.nr_enq_home,
             d.nr_enq_spill,
             d.nr_steals,
         );
         d.plan_hit_pct = plan_hit_pct(
-            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt,
+            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt + d.nr_preempts,
             d.nr_enq_home,
             d.nr_enq_spill,
             d.nr_steals,
