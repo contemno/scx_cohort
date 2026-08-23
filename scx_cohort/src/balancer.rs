@@ -370,6 +370,8 @@ mod tests {
             duty_ns,
             duty_known: true,
             home_ns: 0,
+            latency_score: 0,
+            score_known: false,
             comm: String::new(),
         }
     }

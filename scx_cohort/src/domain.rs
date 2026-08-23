@@ -47,6 +47,12 @@ pub struct TaskSnapshot {
     pub duty_known: bool,
     /// The subset of `duty_ns` executed on the task's home LLC.
     pub home_ns: u64,
+    /// The task's latency score (0..=100) as of its last deschedule.
+    pub latency_score: u32,
+    /// The `duty_known` analog for the score: false until enough
+    /// descheduling runs (`SCORE_MIN_RUNS`) have fed the EWMAs for the
+    /// score to mean anything.
+    pub score_known: bool,
     /// Kernel comm, for rule matching.
     pub comm: String,
 }

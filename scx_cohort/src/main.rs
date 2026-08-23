@@ -71,8 +71,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
 use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
-    CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_PINNED, DEFAULT_SLICE_NS,
-    MAX_CPUS, MAX_LLCS, NR_STATS,
+    CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_NO_PREEMPT,
+    COHORT_PINNED, DEFAULT_SLICE_NS, MAX_CPUS, MAX_LLCS, NR_STATS, SCORE_MIN_RUNS,
 };
 use wake_graph::{WakeGraph, WakeGraphCfg};
 
@@ -140,6 +140,15 @@ struct Opts {
     #[clap(long, default_value = "300")]
     merge_wakes_per_sec: f64,
 
+    /// EXPERIMENTAL. 0 (default): the per-task latency score runs in
+    /// shadow mode — computed and exported, but the binary interactive
+    /// test keeps gating the vtime credit and wakeup preemption. 1-100:
+    /// tasks scoring at or above this replace the binary test for the
+    /// credit and wakee-side preemption (the victim-side batch predicate
+    /// is unaffected).
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=100))]
+    score_gate: u32,
+
     /// Path to the TOML config file ([options] + [[rule]] tables; see
     /// README). The default path is optional: absent means defaults, but
     /// an explicitly passed path must exist.
@@ -192,6 +201,7 @@ impl Opts {
             steal_min: self.steal_min,
             steal_delay_ns: self.steal_delay_us * 1000,
             preempt_min_ns: self.preempt_min_us * 1000,
+            score_gate: self.score_gate,
             ..Tunables::default()
         };
         // The interactive knobs are ratios of a slice stored as absolutes;
@@ -336,6 +346,15 @@ impl<'a> Scheduler<'a> {
             data.tunables.credit_wake_freq_min = t.credit_wake_freq_min;
             data.tunables.credit_runtime_max_ns = t.credit_runtime_max_ns;
             data.tunables.sample_shift = t.sample_shift;
+            data.tunables.score_gate = t.score_gate;
+            if t.score_gate != 0 {
+                warn!(
+                    "--score-gate {} is EXPERIMENTAL: the latency score \
+                     replaces the binary interactive test for the vtime \
+                     credit and wakee-side preemption",
+                    t.score_gate
+                );
+            }
 
             let base = Tunables::default();
             if t.credit_max_ns != base.credit_max_ns
@@ -589,6 +608,8 @@ impl<'a> Scheduler<'a> {
                 duty_ns: ts.runtime_sum.saturating_sub(prev),
                 duty_known,
                 home_ns: ts.runtime_home_sum.saturating_sub(prev_home),
+                latency_score: u32::from(ts.latency_score),
+                score_known: u32::from(ts.score_runs) >= SCORE_MIN_RUNS,
                 comm: String::from_utf8_lossy(&ts.comm[..comm_len]).into_owned(),
             });
         }
@@ -617,11 +638,21 @@ impl<'a> Scheduler<'a> {
         path
     }
 
-    /// Apply TOML rules: pin matched cohorts and collect per-cohort
-    /// residency overrides for the balancer.
+    /// Apply TOML rules: write matched cohorts' policy (pins, per-cohort
+    /// slice, preemption opt-out) and collect per-cohort residency
+    /// overrides for the balancer.
     fn apply_rules(&mut self, tasks: &[TaskSnapshot]) -> Result<()> {
         if self.config.rules.is_empty() {
             return Ok(());
+        }
+
+        /// Policy effects a cohort accumulated from its members' matched
+        /// rules this tick.
+        #[derive(Default)]
+        struct PolicyFx {
+            pin: Option<u32>,
+            slice_ns: Option<u64>,
+            no_preempt: bool,
         }
 
         let live_tgids: std::collections::HashSet<u32> = tasks.iter().map(|t| t.tgid).collect();
@@ -629,15 +660,15 @@ impl<'a> Scheduler<'a> {
             .retain(|tgid, _| live_tgids.contains(tgid));
 
         let mut overrides = HashMap::new();
-        let mut pins: HashMap<u64, u32> = HashMap::new();
+        let mut effects: HashMap<u64, PolicyFx> = HashMap::new();
         for t in tasks {
             let cgroup = self.cgroup_of(t.tgid);
             // Copy the matched rule's effects out immediately so the
             // borrow of self.config doesn't outlive this iteration.
-            let Some((pin, residency)) = self
+            let Some((pin, residency, slice_us, preempt)) = self
                 .config
                 .match_task(&t.comm, &cgroup)
-                .map(|r| (r.pin_ccd, r.min_ccd_residency_ms))
+                .map(|r| (r.pin_ccd, r.min_ccd_residency_ms, r.slice_us, r.preempt))
             else {
                 continue;
             };
@@ -645,27 +676,53 @@ impl<'a> Scheduler<'a> {
                 let e = overrides.entry(t.cohort_id).or_insert(ms);
                 *e = (*e).max(ms);
             }
-            if let Some(ccd) = pin {
-                pins.insert(t.cohort_id, ccd);
+            if pin.is_some() || slice_us.is_some() || preempt == Some(false) {
+                let e = effects.entry(t.cohort_id).or_default();
+                if pin.is_some() {
+                    e.pin = pin;
+                }
+                if let Some(us) = slice_us {
+                    e.slice_ns = Some(us * 1000);
+                }
+                if preempt == Some(false) {
+                    e.no_preempt = true;
+                }
             }
         }
         self.residency_overrides = overrides;
 
+        // Read-modify-write so unmatched fields (a home the balancer
+        // chose, a slice from another member's rule) survive the update.
         let policy_map = &self.skel.maps.cohort_policy;
-        for (cohort, ccd) in pins {
+        for (cohort, fx) in effects {
             let key = cohort.to_ne_bytes();
             let Some(val) = policy_map.lookup(&key, MapFlags::ANY)? else {
                 continue;
             };
-            let Ok(mut policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
+            let Ok(policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
                 continue;
             };
-            let want_home = ccd.min(self.llc_cpus.len() as u32 - 1);
-            if policy.flags & COHORT_PINNED == 0 || policy.home_llc != want_home {
-                debug!("pinning cohort {} to LLC {}", cohort, want_home);
-                policy.flags |= COHORT_PINNED;
-                policy.home_llc = want_home;
-                policy_map.update(&key, policy.as_bytes(), MapFlags::EXIST)?;
+            let mut want = policy;
+            if let Some(ccd) = fx.pin {
+                let want_home = ccd.min(self.llc_cpus.len() as u32 - 1);
+                if want.flags & COHORT_PINNED == 0 || want.home_llc != want_home {
+                    debug!("pinning cohort {} to LLC {}", cohort, want_home);
+                }
+                want.flags |= COHORT_PINNED;
+                want.home_llc = want_home;
+            }
+            if let Some(ns) = fx.slice_ns {
+                if want.slice_ns != ns {
+                    debug!("cohort {} slice set to {} us", cohort, ns / 1000);
+                }
+                want.slice_ns = ns;
+            }
+            if fx.no_preempt && want.flags & COHORT_NO_PREEMPT == 0 {
+                debug!("cohort {} opted out of wakeup preemption", cohort);
+                want.flags |= COHORT_NO_PREEMPT;
+            }
+            if want.as_bytes() != policy.as_bytes() {
+                policy_map.update(&key, want.as_bytes(), MapFlags::EXIST)?;
             }
         }
         Ok(())
@@ -754,9 +811,14 @@ impl<'a> Scheduler<'a> {
         // imbalanced afterwards, the balancer moves it — placement policy
         // stays in one place. Member counts are daemon-derived, so only
         // fresh entries are written; nothing existing is rewritten.
+        // Slice and flags start at the defaults, like any fresh cohort:
+        // the parent's came from rules matching the parent's members, and
+        // if the split-off tgids match too, apply_rules re-establishes
+        // them next tick.
         let new_policy = CohortPolicy {
             home_llc: old_policy.home_llc,
             flags: 0,
+            slice_ns: 0,
         };
         policy_map.update(
             &new_id.to_ne_bytes(),
@@ -922,6 +984,9 @@ impl<'a> Scheduler<'a> {
             nr_steals: c[STAT_STEAL as usize],
             nr_tctx_errors: c[STAT_TCTX_ERR as usize],
             nr_exec_severs: c[STAT_EXEC_SEVER as usize],
+            nr_shadow_both: c[STAT_SHADOW_BOTH as usize],
+            nr_shadow_only_score: c[STAT_SHADOW_ONLY_SCORE as usize],
+            nr_shadow_only_binary: c[STAT_SHADOW_ONLY_BINARY as usize],
             nr_migrations: self.nr_migrations,
             nr_merges: self.nr_merges,
             nr_splits: self.nr_splits,
@@ -1106,6 +1171,12 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     apply!(imbalance_pct);
     apply!(residency_ms);
     apply!(merge_wakes_per_sec);
+    apply!(score_gate);
+    // The CLI parser bounds its own values; a config-sourced gate needs
+    // the same check (101 must fail loudly, not schedule strangely).
+    if opts.score_gate > 100 {
+        bail!("score_gate must be 0..=100, got {}", opts.score_gate);
+    }
 
     Ok(cfg)
 }

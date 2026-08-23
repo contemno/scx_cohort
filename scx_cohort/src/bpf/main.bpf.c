@@ -244,6 +244,37 @@ static bool task_interactive(const struct TaskCtx *tctx)
 	       tctx->avg_runtime_ns <= tunables.credit_runtime_max_ns;
 }
 
+/*
+ * Periodicity points from the wake-interval EWMAs: 100 at perfectly
+ * regular wakeups, falling linearly as jitter approaches the interval.
+ * The first observed interval seeds jitter = interval (100% relative
+ * jitter, 0 points), so regularity must accumulate before points are
+ * earned.
+ *
+ * Mirrored in scx_cohort_common's periodicity_points(); keep in lockstep.
+ */
+static u64 periodicity_points(u64 interval, u64 jitter)
+{
+	u64 rel;
+
+	if (!interval || interval > SCORE_PERIODIC_MAX_NS)
+		return 0;
+	rel = jitter * 100 / interval;
+	return 100 - (rel > 100 ? 100 : rel);
+}
+
+/*
+ * Combine the three 0..=100 signal points into the 0..=100 latency
+ * score: voluntary-block and slice-utilization behavior carry most of
+ * the weight, wake periodicity refines within them.
+ *
+ * Mirrored in scx_cohort_common's combine_score(); keep in lockstep.
+ */
+static u64 combine_score(u64 vol_pts, u64 util_pts, u64 per_pts)
+{
+	return (3 * vol_pts + 3 * util_pts + 2 * per_pts) >> 3;
+}
+
 static u32 llc_of_cpu(s32 cpu)
 {
 	if (cpu >= 0 && cpu < MAX_CPUS)
@@ -284,6 +315,19 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	if (!tctx)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
 
+	/*
+	 * Cache the cohort's scheduling character (per-cohort slice,
+	 * preemption opt-out) while the policy value is being looked up
+	 * anyway, so the insert sites read it from tctx instead of doing
+	 * their own lookups. Done before the spill check: a spilled task
+	 * keeps its cohort, so its slice must not go stale while remote.
+	 */
+	id = resolve_cohort(p, tctx);
+	policy = bpf_map_lookup_elem(&cohort_policy, &id);
+	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
+						      : slice_ns;
+	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
+
 	spill = bpf_map_lookup_elem(&spill_tasks, &pid);
 	if (spill) {
 		tctx->is_spilled = 1;
@@ -293,8 +337,6 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	}
 	tctx->is_spilled = 0;
 
-	id = resolve_cohort(p, tctx);
-	policy = bpf_map_lookup_elem(&cohort_policy, &id);
 	if (!policy)
 		home = llc_of_cpu(scx_bpf_task_cpu(p));
 	else
@@ -303,6 +345,16 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	/* Cached for stopping's home-vs-away runtime accounting. */
 	tctx->home_llc = home;
 	return home;
+}
+
+/*
+ * The slice this task should be granted: its cohort's, cached by
+ * task_home_llc on the wakeup path, or the global default before the
+ * first placement (and for tasks with no context at all).
+ */
+static u64 task_slice(const struct TaskCtx *tctx)
+{
+	return (tctx && tctx->slice_ns) ? tctx->slice_ns : slice_ns;
 }
 
 /*
@@ -406,7 +458,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 			    bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
 			    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu)) {
 				stat_inc(STAT_SYNC_LOCAL);
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 				return cpu;
 			}
 		}
@@ -454,7 +506,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 			scx_bpf_put_idle_cpumask(idle_smt);
 			stat_inc(STAT_PREV_IDLE);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 			return prev_cpu;
 		}
 		scx_bpf_put_idle_cpumask(idle_smt);
@@ -473,14 +525,14 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpu = scx_bpf_pick_idle_cpu(cast_mask(scratch), SCX_PICK_IDLE_CORE);
 	if (cpu >= 0) {
 		stat_inc(STAT_IDLE_CORE);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return cpu;
 	}
 
 	/* prev_cpu idle at all (SMT sibling busy). */
 	if (prev_in_home && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		stat_inc(STAT_IDLE_SMT);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return prev_cpu;
 	}
 
@@ -488,7 +540,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpu = scx_bpf_pick_idle_cpu(cast_mask(scratch), 0);
 	if (cpu >= 0) {
 		stat_inc(STAT_IDLE_SMT);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return cpu;
 	}
 
@@ -515,6 +567,17 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Bound how much vtime credit a long sleeper can accumulate: one
 	 * slice behind the LLC's frontier at most.
+	 *
+	 * Deliberately the GLOBAL slice, as are the interactive-credit
+	 * thresholds it calibrates (scale_to_slice): the clamp window and
+	 * the credit are ordering properties of the shared per-LLC queue,
+	 * where cohorts with different slices mix on one vtime clock —
+	 * scaling them to each enqueuer's cohort slice would hand
+	 * long-slice cohorts a wider backlog window and a bigger queue
+	 * jump, i.e. a priority knob masquerading as a length knob, and
+	 * would need per-wakeup divisions (slice/2, slice*4/5) or a
+	 * per-cohort scaled-tunables cache. The per-cohort slice only
+	 * changes how long a task runs once dispatched.
 	 */
 	if (vtime_before(vtime, vtime_now - slice_ns))
 		vtime = vtime_now - slice_ns;
@@ -524,47 +587,77 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 	 * CCD by a bounded credit. The clamp above plus this fixed bound
 	 * keep the unfairness finite, so batch tasks cannot be starved
 	 * past the watchdog's patience.
+	 *
+	 * The latency score shadows the binary test here: the confusion
+	 * counters record where the two disagree, but with score_gate at
+	 * its default 0 the gate below reduces to the binary test alone —
+	 * behavior is untouched until an operator flips the gate live
+	 * (experimental). Only the credit and this wakee-side preemption
+	 * flip with it; the victim-side curr_batch predicate in running()
+	 * stays on wake_freq regardless, because a low score does not make
+	 * a task safe to preempt (the hackbench middle class again).
 	 */
-	if (tctx && task_interactive(tctx)) {
-		vtime -= tunables.credit_max_ns;
+	if (tctx) {
+		bool binary = task_interactive(tctx);
+		u32 gate = tunables.score_gate;
+		bool by_score = tctx->latency_score >=
+				(gate ? gate : SCORE_SHADOW_THRESH);
 
-		/*
-		 * Queue-jumping only helps once some CPU dispatches; with
-		 * every home CPU held by long-slice batch tasks the wakee
-		 * still waits out someone's slice (measured as pingpong
-		 * p50 doubling under per-CPU spinner load). Preempt the
-		 * wakee's cache-warm prev_cpu instead — but only on a real
-		 * wakeup, only if that CPU currently runs a firmly-batch
-		 * task (one that rarely wakes: a spinner or compiler, not
-		 * a frequently-waking throughput carrier — see the
-		 * curr_batch comment), and at most once per victim CPU
-		 * per preempt_min_ns.
-		 */
-		if ((enq_flags & SCX_ENQ_WAKEUP) && llcx) {
-			const struct cpumask *hmask = cast_mask(llcx->cpumask);
-			s32 prev = scx_bpf_task_cpu(p);
+		if (binary && by_score)
+			stat_inc(STAT_SHADOW_BOTH);
+		else if (by_score)
+			stat_inc(STAT_SHADOW_ONLY_SCORE);
+		else if (binary)
+			stat_inc(STAT_SHADOW_ONLY_BINARY);
 
-			if (hmask && prev >= 0 &&
-			    bpf_cpumask_test_cpu(prev, hmask) &&
-			    bpf_cpumask_test_cpu(prev, p->cpus_ptr)) {
-				const u32 zero = 0;
-				struct scratch_ctx *vs =
-					bpf_map_lookup_percpu_elem(&scratch_stor,
-								   &zero, prev);
-				u64 pnow = scx_bpf_now();
+		if (gate ? by_score : binary) {
+			vtime -= tunables.credit_max_ns;
 
-				if (vs && vs->curr_batch &&
-				    pnow - vs->last_preempt_ts >
-					    tunables.preempt_min_ns) {
-					/* Benign cross-CPU race: worst case
-					 * is one extra preempt. */
-					vs->last_preempt_ts = pnow;
-					stat_inc(STAT_PREEMPT);
-					scx_bpf_dsq_insert(p,
-						SCX_DSQ_LOCAL_ON | (u32)prev,
-						slice_ns,
-						enq_flags | SCX_ENQ_PREEMPT);
-					return;
+			/*
+			 * Queue-jumping only helps once some CPU dispatches;
+			 * with every home CPU held by long-slice batch tasks
+			 * the wakee still waits out someone's slice (measured
+			 * as pingpong p50 doubling under per-CPU spinner
+			 * load). Preempt the wakee's cache-warm prev_cpu
+			 * instead — but only on a real wakeup, only if that
+			 * CPU currently runs a firmly-batch task (one that
+			 * rarely wakes: a spinner or compiler, not a
+			 * frequently-waking throughput carrier — see the
+			 * curr_batch comment), and at most once per victim
+			 * CPU per preempt_min_ns. A cohort carrying
+			 * COHORT_NO_PREEMPT opts its wakeups out of this
+			 * entirely (the credit above still applies);
+			 * no_preempt was cached from the policy by
+			 * task_home_llc on this same enqueue.
+			 */
+			if ((enq_flags & SCX_ENQ_WAKEUP) && llcx &&
+			    !tctx->no_preempt) {
+				const struct cpumask *hmask =
+					cast_mask(llcx->cpumask);
+				s32 prev = scx_bpf_task_cpu(p);
+
+				if (hmask && prev >= 0 &&
+				    bpf_cpumask_test_cpu(prev, hmask) &&
+				    bpf_cpumask_test_cpu(prev, p->cpus_ptr)) {
+					const u32 zero = 0;
+					struct scratch_ctx *vs =
+						bpf_map_lookup_percpu_elem(&scratch_stor,
+									   &zero, prev);
+					u64 pnow = scx_bpf_now();
+
+					if (vs && vs->curr_batch &&
+					    pnow - vs->last_preempt_ts >
+						    tunables.preempt_min_ns) {
+						/* Benign cross-CPU race: worst
+						 * case is one extra preempt. */
+						vs->last_preempt_ts = pnow;
+						stat_inc(STAT_PREEMPT);
+						scx_bpf_dsq_insert(p,
+							SCX_DSQ_LOCAL_ON | (u32)prev,
+							task_slice(tctx),
+							enq_flags | SCX_ENQ_PREEMPT);
+						return;
+					}
 				}
 			}
 		}
@@ -574,7 +667,7 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 		llcx->head_enq_ts = scx_bpf_now();
 
 	stat_inc(tctx && tctx->is_spilled ? STAT_ENQ_SPILL : STAT_ENQ_HOME);
-	scx_bpf_dsq_insert_vtime(p, llc, slice_ns, vtime, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, llc, task_slice(tctx), vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(cohort_dispatch, s32 cpu, struct task_struct *prev)
@@ -645,6 +738,40 @@ void BPF_STRUCT_OPS(cohort_runnable, struct task_struct *p, u64 enq_flags)
 		}
 	}
 	tctx->last_wake_at = now;
+
+	/*
+	 * Periodicity EWMAs for the latency score, on real wakeups only:
+	 * the wake_freq bookkeeping above fires on every runnable
+	 * transition, preempt requeues included, which would read a
+	 * preemption-heavy spell as "periodic wakeups". Jitter tracks
+	 * |interval − avg| against the pre-update average — a MAD proxy
+	 * with no history buffer.
+	 */
+	if (enq_flags & SCX_ENQ_WAKEUP) {
+		if (tctx->last_wakeup_at) {
+			u64 ival = now - tctx->last_wakeup_at;
+			u64 avg = tctx->wake_interval_ewma;
+
+			if (ival > SCORE_INTERVAL_CLAMP_NS)
+				ival = SCORE_INTERVAL_CLAMP_NS;
+			if (avg) {
+				u64 dev = ival > avg ? ival - avg : avg - ival;
+
+				tctx->wake_jitter_ewma =
+					(tctx->wake_jitter_ewma * 3 + dev) / 4;
+				tctx->wake_interval_ewma = (avg * 3 + ival) / 4;
+			} else {
+				/*
+				 * First interval seeds jitter = interval: 100%
+				 * relative jitter, zero points, until observed
+				 * regularity accumulates it away.
+				 */
+				tctx->wake_interval_ewma = ival;
+				tctx->wake_jitter_ewma = ival;
+			}
+		}
+		tctx->last_wakeup_at = now;
+	}
 }
 
 void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
@@ -685,6 +812,28 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 	tctx->vtime += delta * 100 / p->scx.weight;
 	tctx->avg_runtime_ns = (tctx->avg_runtime_ns * 3 + delta) / 4;
 
+	/*
+	 * The latency score's per-deschedule signals. @runnable false is a
+	 * voluntary block (the task slept of its own accord); true means
+	 * preemption or slice exhaustion. Utilization divides this run by
+	 * the slice the task was actually granted, so the signal is
+	 * slice-relative by construction and needs no scale_to_slice
+	 * recalibration. Costs two u64 divisions; no new map lookups.
+	 */
+	{
+		u64 util = delta * 100 / task_slice(tctx);
+		u64 per = periodicity_points(tctx->wake_interval_ewma,
+					     tctx->wake_jitter_ewma);
+
+		if (util > 100)
+			util = 100;
+		tctx->vol_ewma = (tctx->vol_ewma * 3 + (runnable ? 0 : 100)) / 4;
+		tctx->slice_util_ewma = (tctx->slice_util_ewma * 3 + util) / 4;
+		tctx->latency_score = combine_score(tctx->vol_ewma,
+						    100 - tctx->slice_util_ewma,
+						    per);
+	}
+
 	counters = bpf_map_lookup_elem(&cohort_counters, &tctx->cohort_id);
 	if (counters)
 		__sync_fetch_and_add(&counters->load_sum, scaled);
@@ -705,6 +854,9 @@ void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
 				ts->runtime_home_sum += delta;
 			/* Keeps the daemon's view current across merges. */
 			ts->cohort_id = tctx->cohort_id;
+			ts->latency_score = tctx->latency_score;
+			if (ts->score_runs < 0xffff)
+				ts->score_runs++;
 		}
 	}
 }
@@ -788,6 +940,24 @@ int BPF_PROG(cohort_exec_sever, struct task_struct *p, pid_t old_pid,
 	id = new_cohort();
 	bpf_map_update_elem(&tgid_cohort, &tgid, &id, BPF_ANY);
 	tctx->cohort_id = id;
+	/*
+	 * The fresh cohort has default policy (global slice, preemption
+	 * on); drop whatever the old cohort's rules had cached rather
+	 * than carrying it until the next wakeup refreshes it.
+	 */
+	tctx->slice_ns = slice_ns;
+	tctx->no_preempt = 0;
+	/*
+	 * A new program image invalidates the old one's behavioral
+	 * history; the latency score restarts from scratch like the
+	 * cached policy above.
+	 */
+	tctx->last_wakeup_at = 0;
+	tctx->wake_interval_ewma = 0;
+	tctx->wake_jitter_ewma = 0;
+	tctx->vol_ewma = 0;
+	tctx->slice_util_ewma = 0;
+	tctx->latency_score = 0;
 	counters = bpf_map_lookup_elem(&cohort_counters, &id);
 	if (counters)
 		__sync_fetch_and_add(&counters->nr_tasks, 1);
@@ -813,6 +983,9 @@ int BPF_PROG(cohort_exec_sever, struct task_struct *p, pid_t old_pid,
 		if (ts) {
 			ts->cohort_id = id;
 			__builtin_memcpy(ts->comm, p->comm, sizeof(ts->comm));
+			/* The exported score restarts with the history. */
+			ts->latency_score = 0;
+			ts->score_runs = 0;
 		}
 		/* Any spill mark belonged to the old cohort's plan. */
 		bpf_map_delete_elem(&spill_tasks, &pid);
@@ -848,6 +1021,10 @@ s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 
 		tctx->vtime = llcx ? llcx->vtime_now : 0;
 	}
+	/* Seed the cached scheduling character; wakeups keep it fresh. */
+	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
+						      : slice_ns;
+	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
 
 	{
 		u32 pid = p->pid;

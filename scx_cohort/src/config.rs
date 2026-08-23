@@ -18,6 +18,11 @@
 //! [[rule]]
 //! match_comm = ["my-benchmark"]
 //! pin_ccd = 0                   # nail the cohort to CCD 0
+//!
+//! [[rule]]
+//! match_comm = ["audio-engine"]
+//! slice_us = 500                # short per-cohort slice
+//! preempt = false               # its wakeups never preempt others
 //! ```
 //!
 //! Rules are evaluated in file order; the first match wins.
@@ -57,6 +62,10 @@ pub struct OptionsTable {
     pub residency_ms: Option<u64>,
     /// Sustained cross-cohort wake rate that merges cohorts.
     pub merge_wakes_per_sec: Option<f64>,
+    /// EXPERIMENTAL: latency-score gate (0 = shadow mode, 1..=100 = the
+    /// score replaces the binary interactive test at this threshold).
+    /// Bounds are enforced where `[options]` folds into the CLI opts.
+    pub score_gate: Option<u32>,
     /// SCHED_FIFO priority for the daemon; 0 disables the RT boost.
     pub rt_priority: Option<i32>,
     /// Drop ALL capabilities once the scheduler is attached. The daemon
@@ -80,6 +89,13 @@ pub struct RuleFile {
     pub pin_ccd: Option<u32>,
     /// Extra migration hysteresis for the matching task's cohort.
     pub min_ccd_residency_ms: Option<u64>,
+    /// Per-cohort scheduling slice in microseconds for the matching
+    /// task's cohort (the global `--slice-us` applies otherwise).
+    pub slice_us: Option<u64>,
+    /// `preempt = false`: the matching task's cohort's wakeups never
+    /// preempt a running task. Only `false` is meaningful; `true` (the
+    /// default behavior anyway) is accepted as a no-op.
+    pub preempt: Option<bool>,
 }
 
 /// A compiled rule ready for matching.
@@ -89,6 +105,8 @@ pub struct Rule {
     cgroup: Option<GlobMatcher>,
     pub pin_ccd: Option<u32>,
     pub min_ccd_residency_ms: Option<u64>,
+    pub slice_us: Option<u64>,
+    pub preempt: Option<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +128,14 @@ impl Config {
             if r.match_comm.is_none() && r.match_cgroup.is_none() {
                 bail!("rule {}: needs match_comm and/or match_cgroup", i + 1);
             }
+            if let Some(us) = r.slice_us {
+                if us == 0 || us > 100_000 {
+                    bail!(
+                        "rule {}: slice_us must be between 1 and 100000 (microseconds), got {us}",
+                        i + 1
+                    );
+                }
+            }
             rules.push(Rule {
                 comms: r.match_comm,
                 cgroup: match &r.match_cgroup {
@@ -122,6 +148,8 @@ impl Config {
                 },
                 pin_ccd: r.pin_ccd,
                 min_ccd_residency_ms: r.min_ccd_residency_ms,
+                slice_us: r.slice_us,
+                preempt: r.preempt,
             });
         }
         Ok(Self {
@@ -231,6 +259,45 @@ pin_ccd = 1
     }
 
     #[test]
+    fn slice_and_preempt_keys_parse() {
+        let cfg = Config::parse(
+            r#"
+[[rule]]
+match_comm = ["latency-thing"]
+slice_us = 1000
+preempt = false
+"#,
+        )
+        .unwrap();
+        let rule = cfg.match_task("latency-thing", "").unwrap();
+        assert_eq!(rule.slice_us, Some(1000));
+        assert_eq!(rule.preempt, Some(false));
+        // Absent on rules that don't set them.
+        let cfg = Config::parse(SAMPLE).unwrap();
+        let rule = cfg.match_task("my-benchmark", "").unwrap();
+        assert!(rule.slice_us.is_none());
+        assert!(rule.preempt.is_none());
+    }
+
+    #[test]
+    fn preempt_true_is_an_accepted_noop() {
+        let cfg = Config::parse("[[rule]]\nmatch_comm = [\"a\"]\npreempt = true").unwrap();
+        assert_eq!(cfg.match_task("a", "").unwrap().preempt, Some(true));
+    }
+
+    #[test]
+    fn slice_us_bounds_rejected() {
+        // Zero would read as "use the global slice" in the policy map;
+        // reject it rather than let it silently no-op.
+        assert!(Config::parse("[[rule]]\nmatch_comm = [\"a\"]\nslice_us = 0").is_err());
+        // Above 100 ms is a typo, not a slice.
+        assert!(Config::parse("[[rule]]\nmatch_comm = [\"a\"]\nslice_us = 100001").is_err());
+        // The bounds themselves are fine.
+        assert!(Config::parse("[[rule]]\nmatch_comm = [\"a\"]\nslice_us = 1").is_ok());
+        assert!(Config::parse("[[rule]]\nmatch_comm = [\"a\"]\nslice_us = 100000").is_ok());
+    }
+
+    #[test]
     fn options_table_parses() {
         let cfg = Config::parse(
             "[options]\nslice_us = 3000\nrt_priority = 0\n\n[[rule]]\nmatch_comm = [\"a\"]\npin_ccd = 1",
@@ -240,6 +307,17 @@ pin_ccd = 1
         assert_eq!(cfg.options.rt_priority, Some(0));
         assert!(cfg.options.interval_ms.is_none());
         assert_eq!(cfg.rules.len(), 1);
+    }
+
+    #[test]
+    fn score_gate_option_parses() {
+        let cfg = Config::parse("[options]\nscore_gate = 60").unwrap();
+        assert_eq!(cfg.options.score_gate, Some(60));
+        assert!(Config::parse("").unwrap().options.score_gate.is_none());
+        // Negative or non-integer values are type errors at parse time;
+        // the 0..=100 range is enforced when options fold into the CLI.
+        assert!(Config::parse("[options]\nscore_gate = -1").is_err());
+        assert!(Config::parse("[options]\nscore_gate = 6.5").is_err());
     }
 
     #[test]
