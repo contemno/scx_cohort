@@ -134,12 +134,21 @@ min_ccd_residency_ms = 5000   # extra migration hysteresis for games
 [[rule]]
 match_comm = ["my-benchmark"]
 pin_ccd = 0                   # nail this cohort to CCD 0
+
+[[rule]]
+match_comm = ["audio-engine"]
+slice_us = 500                # short per-cohort slice for low latency
+preempt = false               # its wakeups never preempt running tasks
 ```
 
 `[[rule]]` keys: `match_comm` (list of exact comm names), `match_cgroup`
 (glob against the cgroup v2 path), `pin_ccd` (pin the matching task's
 cohort to a CCD), `min_ccd_residency_ms` (per-cohort balancer hysteresis
-override), `join_cohort_of = "parent"` (documents the default lineage
+override), `slice_us` (per-cohort scheduling slice, 1–100000 µs,
+overriding the global `--slice-us` for that cohort's tasks), `preempt =
+false` (the matching task's cohort's interactive wakeups keep their
+vtime credit but never preempt a running task; `true` is the default and
+a no-op), `join_cohort_of = "parent"` (documents the default lineage
 behavior). Rules are evaluated in order; the first match wins; criteria
 within a rule AND together.
 

@@ -284,6 +284,19 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	if (!tctx)
 		return llc_of_cpu(scx_bpf_task_cpu(p));
 
+	/*
+	 * Cache the cohort's scheduling character (per-cohort slice,
+	 * preemption opt-out) while the policy value is being looked up
+	 * anyway, so the insert sites read it from tctx instead of doing
+	 * their own lookups. Done before the spill check: a spilled task
+	 * keeps its cohort, so its slice must not go stale while remote.
+	 */
+	id = resolve_cohort(p, tctx);
+	policy = bpf_map_lookup_elem(&cohort_policy, &id);
+	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
+						      : slice_ns;
+	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
+
 	spill = bpf_map_lookup_elem(&spill_tasks, &pid);
 	if (spill) {
 		tctx->is_spilled = 1;
@@ -293,8 +306,6 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	}
 	tctx->is_spilled = 0;
 
-	id = resolve_cohort(p, tctx);
-	policy = bpf_map_lookup_elem(&cohort_policy, &id);
 	if (!policy)
 		home = llc_of_cpu(scx_bpf_task_cpu(p));
 	else
@@ -303,6 +314,16 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	/* Cached for stopping's home-vs-away runtime accounting. */
 	tctx->home_llc = home;
 	return home;
+}
+
+/*
+ * The slice this task should be granted: its cohort's, cached by
+ * task_home_llc on the wakeup path, or the global default before the
+ * first placement (and for tasks with no context at all).
+ */
+static u64 task_slice(const struct TaskCtx *tctx)
+{
+	return (tctx && tctx->slice_ns) ? tctx->slice_ns : slice_ns;
 }
 
 /*
@@ -406,7 +427,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 			    bpf_cpumask_test_cpu(cpu, p->cpus_ptr) &&
 			    !scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu)) {
 				stat_inc(STAT_SYNC_LOCAL);
-				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+				scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 				return cpu;
 			}
 		}
@@ -454,7 +475,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 			scx_bpf_put_idle_cpumask(idle_smt);
 			stat_inc(STAT_PREV_IDLE);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 			return prev_cpu;
 		}
 		scx_bpf_put_idle_cpumask(idle_smt);
@@ -473,14 +494,14 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpu = scx_bpf_pick_idle_cpu(cast_mask(scratch), SCX_PICK_IDLE_CORE);
 	if (cpu >= 0) {
 		stat_inc(STAT_IDLE_CORE);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return cpu;
 	}
 
 	/* prev_cpu idle at all (SMT sibling busy). */
 	if (prev_in_home && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		stat_inc(STAT_IDLE_SMT);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return prev_cpu;
 	}
 
@@ -488,7 +509,7 @@ s32 BPF_STRUCT_OPS(cohort_select_cpu, struct task_struct *p, s32 prev_cpu,
 	cpu = scx_bpf_pick_idle_cpu(cast_mask(scratch), 0);
 	if (cpu >= 0) {
 		stat_inc(STAT_IDLE_SMT);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice(tctx), 0);
 		return cpu;
 	}
 
@@ -515,6 +536,17 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 	/*
 	 * Bound how much vtime credit a long sleeper can accumulate: one
 	 * slice behind the LLC's frontier at most.
+	 *
+	 * Deliberately the GLOBAL slice, as are the interactive-credit
+	 * thresholds it calibrates (scale_to_slice): the clamp window and
+	 * the credit are ordering properties of the shared per-LLC queue,
+	 * where cohorts with different slices mix on one vtime clock —
+	 * scaling them to each enqueuer's cohort slice would hand
+	 * long-slice cohorts a wider backlog window and a bigger queue
+	 * jump, i.e. a priority knob masquerading as a length knob, and
+	 * would need per-wakeup divisions (slice/2, slice*4/5) or a
+	 * per-cohort scaled-tunables cache. The per-cohort slice only
+	 * changes how long a task runs once dispatched.
 	 */
 	if (vtime_before(vtime, vtime_now - slice_ns))
 		vtime = vtime_now - slice_ns;
@@ -538,9 +570,12 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 		 * task (one that rarely wakes: a spinner or compiler, not
 		 * a frequently-waking throughput carrier — see the
 		 * curr_batch comment), and at most once per victim CPU
-		 * per preempt_min_ns.
+		 * per preempt_min_ns. A cohort carrying COHORT_NO_PREEMPT
+		 * opts its wakeups out of this entirely (the credit above
+		 * still applies); no_preempt was cached from the policy by
+		 * task_home_llc on this same enqueue.
 		 */
-		if ((enq_flags & SCX_ENQ_WAKEUP) && llcx) {
+		if ((enq_flags & SCX_ENQ_WAKEUP) && llcx && !tctx->no_preempt) {
 			const struct cpumask *hmask = cast_mask(llcx->cpumask);
 			s32 prev = scx_bpf_task_cpu(p);
 
@@ -562,7 +597,7 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 					stat_inc(STAT_PREEMPT);
 					scx_bpf_dsq_insert(p,
 						SCX_DSQ_LOCAL_ON | (u32)prev,
-						slice_ns,
+						task_slice(tctx),
 						enq_flags | SCX_ENQ_PREEMPT);
 					return;
 				}
@@ -574,7 +609,7 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 		llcx->head_enq_ts = scx_bpf_now();
 
 	stat_inc(tctx && tctx->is_spilled ? STAT_ENQ_SPILL : STAT_ENQ_HOME);
-	scx_bpf_dsq_insert_vtime(p, llc, slice_ns, vtime, enq_flags);
+	scx_bpf_dsq_insert_vtime(p, llc, task_slice(tctx), vtime, enq_flags);
 }
 
 void BPF_STRUCT_OPS(cohort_dispatch, s32 cpu, struct task_struct *prev)
@@ -788,6 +823,13 @@ int BPF_PROG(cohort_exec_sever, struct task_struct *p, pid_t old_pid,
 	id = new_cohort();
 	bpf_map_update_elem(&tgid_cohort, &tgid, &id, BPF_ANY);
 	tctx->cohort_id = id;
+	/*
+	 * The fresh cohort has default policy (global slice, preemption
+	 * on); drop whatever the old cohort's rules had cached rather
+	 * than carrying it until the next wakeup refreshes it.
+	 */
+	tctx->slice_ns = slice_ns;
+	tctx->no_preempt = 0;
 	counters = bpf_map_lookup_elem(&cohort_counters, &id);
 	if (counters)
 		__sync_fetch_and_add(&counters->nr_tasks, 1);
@@ -848,6 +890,10 @@ s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 
 		tctx->vtime = llcx ? llcx->vtime_now : 0;
 	}
+	/* Seed the cached scheduling character; wakeups keep it fresh. */
+	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
+						      : slice_ns;
+	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
 
 	{
 		u32 pid = p->pid;

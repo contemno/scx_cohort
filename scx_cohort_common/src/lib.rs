@@ -40,6 +40,13 @@ pub const COHORT_INVALID: u64 = 0;
 /// rule; the load balancer must not move it.
 pub const COHORT_PINNED: u32 = 1;
 
+/// `CohortPolicy::flags` bit: wakeups of this cohort's tasks never preempt
+/// a running task, even when the wakee carries the interactive signature.
+/// The wakee still receives the interactive vtime credit; only the
+/// `SCX_ENQ_PREEMPT` insert in `cohort_enqueue` is skipped. Set from a
+/// `preempt = false` rule.
+pub const COHORT_NO_PREEMPT: u32 = 2;
+
 /// Placement-statistics slots, aggregated per-CPU on the BPF side and
 /// summed by the daemon each tick.
 pub const STAT_SYNC_LOCAL: u32 = 0;
@@ -85,7 +92,14 @@ pub struct TaskCtx {
     /// compares it against the LLC that actually ran the task to account
     /// home-vs-away runtime.
     pub home_llc: u32,
-    pub _pad: u32,
+    /// Nonzero when the task's cohort carries [`COHORT_NO_PREEMPT`];
+    /// cached alongside `slice_ns` so `enqueue` needs no policy lookup.
+    pub no_preempt: u32,
+    /// Effective slice for this task, cached from its cohort's policy on
+    /// the wakeup path (`task_home_llc`). Always a real slice once the
+    /// task has been placed; the BPF side falls back to the global slice
+    /// while it is still zero.
+    pub slice_ns: u64,
 }
 
 /// Per-cohort placement policy. Created once by the BPF side when a
@@ -101,6 +115,12 @@ pub struct CohortPolicy {
     pub home_llc: u32,
     /// `COHORT_PINNED` etc.
     pub flags: u32,
+    /// Per-cohort scheduling slice in nanoseconds; 0 means "use the
+    /// global slice". Set from a `slice_us` rule. Deliberately NOT fed
+    /// into [`Tunables::scale_to_slice`]: the interactive-credit
+    /// calibration stays tied to the global slice (see the comment at
+    /// the vtime clamp in `cohort_enqueue`).
+    pub slice_ns: u64,
 }
 
 /// Per-cohort counters, written only by the BPF side (atomically); the
@@ -236,9 +256,10 @@ mod tests {
     /// assertions pin them so refactors can't change them unnoticed.
     #[test]
     fn layouts_are_stable() {
-        assert_eq!(size_of::<TaskCtx>(), 64);
+        assert_eq!(size_of::<TaskCtx>(), 72);
         assert_eq!(align_of::<TaskCtx>(), 8);
-        assert_eq!(size_of::<CohortPolicy>(), 8);
+        assert_eq!(size_of::<CohortPolicy>(), 16);
+        assert_eq!(align_of::<CohortPolicy>(), 8);
         assert_eq!(size_of::<CohortCounters>(), 16);
         assert_eq!(align_of::<CohortCounters>(), 8);
         assert_eq!(size_of::<WakeEdgeKey>(), 8);

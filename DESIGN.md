@@ -113,6 +113,8 @@ min_ccd_residency_ms = 5000   # extra migration hysteresis for games
 
 Rules are a tuning aid. The design stands on the automatic mechanisms.
 
+Rules also carry the first per-cohort *policy* knobs — not just placement: `slice_us` gives a cohort its own scheduling slice and `preempt = false` opts a cohort's wakeups out of interactive preemption, so a latency cohort can run short slices while a batch cohort runs long ones, within one scheduler. The BPF side caches the effective slice in the task context during the wakeup path's existing policy lookup, so the per-wakeup cost stays at map lookups. The interactive-credit calibration and the vtime clamp deliberately stay tied to the global slice: they order the shared per-CCD queue where cohorts with different slices mix.
+
 ### 4.2 Placement policy (BPF fast path)
 
 Two custom DSQs, one per CCD, vtime-ordered for fairness within the CCD. Per-CPU local DSQs are used for direct dispatch on the wakeup path.
