@@ -76,7 +76,11 @@ scx_cohort top                              # per-cohort/per-process view
 utilization, affinity) with its member processes beneath (threads, `sN` =
 N threads currently spilled to the other CCD). The headline number is
 **affinity** — the percentage of runtime executed on the home CCD.
-Regressions show up there before they show up in frame times.
+Regressions show up there before they show up in frame times. The `LAT`
+column is the per-task latency score (0–100; the maximum over threads
+whose score has enough samples to mean anything) — the shadow-mode
+classifier of DESIGN.md §4.6, whose agreement with the binary
+interactive test appears as the `shadow:` line in `--monitor` output.
 
 The daemon raises itself to `SCHED_FIFO 10` so it can never be starved by
 the scheduling class it implements (`--no-rt` or `rt_priority = 0` in the
@@ -96,6 +100,7 @@ scheduler with a restart code; the daemon re-initializes automatically
 | `--imbalance-pct` | 20 | Inter-CCD load gap (as % of one CCD) that triggers a cohort move. |
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |
+| `--score-gate` | 0 | **Experimental.** 0 keeps the per-task latency score in shadow mode: computed and exported (the `LAT` column, the `shadow:` monitor counters) but never gating. 1–100 makes `score >= gate` replace the binary interactive test for the vtime credit and wakee-side preemption; the victim-side batch predicate is unaffected. See DESIGN.md §4.6. |
 | `--config <path>` | `/etc/scx_cohort.conf` | Config file. The default path may be absent; an explicit one must exist. |
 | `--no-rt` | off | Don't raise the daemon to SCHED_FIFO. |
 | `--stats <sec>` | — | Print aggregate metrics every interval while scheduling. |
@@ -121,6 +126,7 @@ preempt_min_us = 200
 imbalance_pct = 20
 residency_ms = 2000
 merge_wakes_per_sec = 300.0
+score_gate = 0                # experimental; see --score-gate
 rt_priority = 10              # SCHED_FIFO priority; 0 disables
 
 [[rule]]

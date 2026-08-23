@@ -72,7 +72,7 @@ use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
 use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
     CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_NO_PREEMPT,
-    COHORT_PINNED, DEFAULT_SLICE_NS, MAX_CPUS, MAX_LLCS, NR_STATS,
+    COHORT_PINNED, DEFAULT_SLICE_NS, MAX_CPUS, MAX_LLCS, NR_STATS, SCORE_MIN_RUNS,
 };
 use wake_graph::{WakeGraph, WakeGraphCfg};
 
@@ -140,6 +140,15 @@ struct Opts {
     #[clap(long, default_value = "300")]
     merge_wakes_per_sec: f64,
 
+    /// EXPERIMENTAL. 0 (default): the per-task latency score runs in
+    /// shadow mode — computed and exported, but the binary interactive
+    /// test keeps gating the vtime credit and wakeup preemption. 1-100:
+    /// tasks scoring at or above this replace the binary test for the
+    /// credit and wakee-side preemption (the victim-side batch predicate
+    /// is unaffected).
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=100))]
+    score_gate: u32,
+
     /// Path to the TOML config file ([options] + [[rule]] tables; see
     /// README). The default path is optional: absent means defaults, but
     /// an explicitly passed path must exist.
@@ -192,6 +201,7 @@ impl Opts {
             steal_min: self.steal_min,
             steal_delay_ns: self.steal_delay_us * 1000,
             preempt_min_ns: self.preempt_min_us * 1000,
+            score_gate: self.score_gate,
             ..Tunables::default()
         };
         // The interactive knobs are ratios of a slice stored as absolutes;
@@ -336,6 +346,15 @@ impl<'a> Scheduler<'a> {
             data.tunables.credit_wake_freq_min = t.credit_wake_freq_min;
             data.tunables.credit_runtime_max_ns = t.credit_runtime_max_ns;
             data.tunables.sample_shift = t.sample_shift;
+            data.tunables.score_gate = t.score_gate;
+            if t.score_gate != 0 {
+                warn!(
+                    "--score-gate {} is EXPERIMENTAL: the latency score \
+                     replaces the binary interactive test for the vtime \
+                     credit and wakee-side preemption",
+                    t.score_gate
+                );
+            }
 
             let base = Tunables::default();
             if t.credit_max_ns != base.credit_max_ns
@@ -589,6 +608,8 @@ impl<'a> Scheduler<'a> {
                 duty_ns: ts.runtime_sum.saturating_sub(prev),
                 duty_known,
                 home_ns: ts.runtime_home_sum.saturating_sub(prev_home),
+                latency_score: u32::from(ts.latency_score),
+                score_known: u32::from(ts.score_runs) >= SCORE_MIN_RUNS,
                 comm: String::from_utf8_lossy(&ts.comm[..comm_len]).into_owned(),
             });
         }
@@ -963,6 +984,9 @@ impl<'a> Scheduler<'a> {
             nr_steals: c[STAT_STEAL as usize],
             nr_tctx_errors: c[STAT_TCTX_ERR as usize],
             nr_exec_severs: c[STAT_EXEC_SEVER as usize],
+            nr_shadow_both: c[STAT_SHADOW_BOTH as usize],
+            nr_shadow_only_score: c[STAT_SHADOW_ONLY_SCORE as usize],
+            nr_shadow_only_binary: c[STAT_SHADOW_ONLY_BINARY as usize],
             nr_migrations: self.nr_migrations,
             nr_merges: self.nr_merges,
             nr_splits: self.nr_splits,
@@ -1147,6 +1171,12 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     apply!(imbalance_pct);
     apply!(residency_ms);
     apply!(merge_wakes_per_sec);
+    apply!(score_gate);
+    // The CLI parser bounds its own values; a config-sourced gate needs
+    // the same check (101 must fail loudly, not schedule strangely).
+    if opts.score_gate > 100 {
+        bail!("score_gate must be 0..=100, got {}", opts.score_gate);
+    }
 
     Ok(cfg)
 }

@@ -64,6 +64,13 @@ pub struct Metrics {
     #[stat(desc = "task context lookup failures (should stay 0)")]
     pub nr_tctx_errors: u64,
 
+    #[stat(desc = "enqueues where the latency score and binary test both said interactive")]
+    pub nr_shadow_both: u64,
+    #[stat(desc = "enqueues where only the latency score said interactive")]
+    pub nr_shadow_only_score: u64,
+    #[stat(desc = "enqueues where only the binary test said interactive")]
+    pub nr_shadow_only_binary: u64,
+
     #[stat(desc = "cohorts started fresh at exec (lineage severed)")]
     pub nr_exec_severs: u64,
     #[stat(desc = "cohort home moves by the load balancer")]
@@ -108,6 +115,11 @@ impl Metrics {
             self.nr_steals,
             self.nr_tctx_errors,
         )?;
+        writeln!(
+            w,
+            "  shadow: both={} only_score={} only_binary={}",
+            self.nr_shadow_both, self.nr_shadow_only_score, self.nr_shadow_only_binary,
+        )?;
         for (id, llc) in self.llcs.iter() {
             writeln!(
                 w,
@@ -137,6 +149,13 @@ impl Metrics {
             nr_enq_spill: self.nr_enq_spill.saturating_sub(rhs.nr_enq_spill),
             nr_steals: self.nr_steals.saturating_sub(rhs.nr_steals),
             nr_tctx_errors: self.nr_tctx_errors.saturating_sub(rhs.nr_tctx_errors),
+            nr_shadow_both: self.nr_shadow_both.saturating_sub(rhs.nr_shadow_both),
+            nr_shadow_only_score: self
+                .nr_shadow_only_score
+                .saturating_sub(rhs.nr_shadow_only_score),
+            nr_shadow_only_binary: self
+                .nr_shadow_only_binary
+                .saturating_sub(rhs.nr_shadow_only_binary),
             nr_exec_severs: self.nr_exec_severs.saturating_sub(rhs.nr_exec_severs),
             nr_migrations: self.nr_migrations.saturating_sub(rhs.nr_migrations),
             nr_merges: self.nr_merges.saturating_sub(rhs.nr_merges),
@@ -208,6 +227,8 @@ pub struct ProcRow {
     pub util_pct: f64,
     #[stat(desc = "% of runtime executed on the home CCD")]
     pub affinity_pct: f64,
+    #[stat(desc = "max latency score (0-100) over score-known threads")]
+    pub lat_score: u64,
 }
 
 /// One cohort with its member processes.
@@ -225,6 +246,8 @@ pub struct CohortRow {
     pub util_pct: f64,
     #[stat(desc = "% of member runtime executed on the home CCD")]
     pub affinity_pct: f64,
+    #[stat(desc = "max latency score (0-100) over score-known members")]
+    pub lat_score: u64,
     #[stat(desc = "member processes, keyed by tgid")]
     pub procs: BTreeMap<usize, ProcRow>,
 }
@@ -302,6 +325,15 @@ pub fn procs_snapshot(
             proc_row.util_pct += t.duty_ns as f64 * 100.0 / tick_ns as f64;
             // Accumulate ns; converted to a percentage below.
             proc_row.affinity_pct += t.home_ns as f64;
+            // Max, not a duty-weighted mean: the question this column
+            // answers is "does this contain a latency-sensitive thread",
+            // and a mean would bury a 2%-duty audio thread under a
+            // 100%-duty worker. Unknown scores (too few runs) don't vote.
+            if t.score_known {
+                let score = u64::from(t.latency_score);
+                proc_row.lat_score = proc_row.lat_score.max(score);
+                row.lat_score = row.lat_score.max(score);
+            }
         }
         for proc_row in row.procs.values_mut() {
             let duty_ns = proc_row.util_pct / 100.0 * tick_ns as f64;
@@ -436,12 +468,28 @@ mod tests {
             duty_ns: duty,
             duty_known: true,
             home_ns: home,
+            latency_score: 0,
+            score_known: false,
             comm: comm.into(),
         };
+        // Scores: 101 is a known 85, 102 an UNKNOWN 99 (too few runs —
+        // must not win the max), 201 a known 30.
         let tasks = [
-            t(101, 100, tick_ns / 2, tick_ns / 2, "game"),
-            t(102, 100, tick_ns / 2, tick_ns / 4, "game"),
-            t(201, 200, tick_ns / 4, 0, "helper"),
+            TaskSnapshot {
+                latency_score: 85,
+                score_known: true,
+                ..t(101, 100, tick_ns / 2, tick_ns / 2, "game")
+            },
+            TaskSnapshot {
+                latency_score: 99,
+                score_known: false,
+                ..t(102, 100, tick_ns / 2, tick_ns / 4, "game")
+            },
+            TaskSnapshot {
+                latency_score: 30,
+                score_known: true,
+                ..t(201, 200, tick_ns / 4, 0, "helper")
+            },
         ];
         let llcs = [
             LlcLoad {
@@ -468,15 +516,21 @@ mod tests {
         // Cohort affinity: (0.5 + 0.25 + 0) / 1.25 = 60%.
         assert!((c.affinity_pct - 60.0).abs() < 0.1);
 
+        // Max over score-KNOWN members only: the unknown 99 must lose to
+        // the known 85 at both the process and cohort level.
+        assert_eq!(c.lat_score, 85);
+
         let game = &c.procs[&100];
         assert_eq!(game.threads, 2);
         assert_eq!(game.spilled, 0);
         assert!((game.util_pct - 100.0).abs() < 0.1);
         assert!((game.affinity_pct - 75.0).abs() < 0.1);
+        assert_eq!(game.lat_score, 85);
 
         let helper = &c.procs[&200];
         assert_eq!(helper.spilled, 1);
         assert!((helper.affinity_pct - 0.0).abs() < 0.1);
+        assert_eq!(helper.lat_score, 30);
         // LLC 1 runs 1 tick of work on 8 CPUs → 12.5%.
         assert!((s.llc_util_pct[&1] - 12.5).abs() < 0.1);
     }

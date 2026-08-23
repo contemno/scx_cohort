@@ -42,8 +42,8 @@ fn render(s: &ProcsSnapshot) {
     ));
     lines.push(String::new());
     lines.push(format!(
-        "{:<10} {:<18} {:>4} {:>8} {:>7} {:>9}",
-        "COHORT", "COMM", "CCD", "THREADS", "UTIL%", "AFFINITY%"
+        "{:<10} {:<18} {:>4} {:>8} {:>7} {:>9} {:>4}",
+        "COHORT", "COMM", "CCD", "THREADS", "UTIL%", "AFFINITY%", "LAT"
     ));
 
     // Cohorts by utilization, hottest first; processes likewise within.
@@ -52,7 +52,7 @@ fn render(s: &ProcsSnapshot) {
 
     for (id, c) in cohorts {
         lines.push(format!(
-            "{:<10} {:<18} {:>3}{} {:>8} {:>7.1} {:>9.1}",
+            "{:<10} {:<18} {:>3}{} {:>8} {:>7.1} {:>9.1} {:>4}",
             id,
             "─ cohort ─",
             c.home_llc,
@@ -60,12 +60,13 @@ fn render(s: &ProcsSnapshot) {
             c.tasks,
             c.util_pct,
             c.affinity_pct,
+            c.lat_score,
         ));
         let mut procs: Vec<&crate::stats::ProcRow> = c.procs.values().collect();
         procs.sort_by(|a, b| b.util_pct.total_cmp(&a.util_pct));
         for p in procs {
             lines.push(format!(
-                "  {:<8} {:<18} {:>4} {:>5}{:>3} {:>7.1} {:>9.1}",
+                "  {:<8} {:<18} {:>4} {:>5}{:>3} {:>7.1} {:>9.1} {:>4}",
                 p.tgid,
                 if p.comm.len() > 18 {
                     &p.comm[..18]
@@ -81,6 +82,7 @@ fn render(s: &ProcsSnapshot) {
                 },
                 p.util_pct,
                 p.affinity_pct,
+                p.lat_score,
             ));
         }
     }

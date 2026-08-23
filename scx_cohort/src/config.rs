@@ -62,6 +62,10 @@ pub struct OptionsTable {
     pub residency_ms: Option<u64>,
     /// Sustained cross-cohort wake rate that merges cohorts.
     pub merge_wakes_per_sec: Option<f64>,
+    /// EXPERIMENTAL: latency-score gate (0 = shadow mode, 1..=100 = the
+    /// score replaces the binary interactive test at this threshold).
+    /// Bounds are enforced where `[options]` folds into the CLI opts.
+    pub score_gate: Option<u32>,
     /// SCHED_FIFO priority for the daemon; 0 disables the RT boost.
     pub rt_priority: Option<i32>,
     /// Drop ALL capabilities once the scheduler is attached. The daemon
@@ -303,6 +307,17 @@ preempt = false
         assert_eq!(cfg.options.rt_priority, Some(0));
         assert!(cfg.options.interval_ms.is_none());
         assert_eq!(cfg.rules.len(), 1);
+    }
+
+    #[test]
+    fn score_gate_option_parses() {
+        let cfg = Config::parse("[options]\nscore_gate = 60").unwrap();
+        assert_eq!(cfg.options.score_gate, Some(60));
+        assert!(Config::parse("").unwrap().options.score_gate.is_none());
+        // Negative or non-integer values are type errors at parse time;
+        // the 0..=100 range is enforced when options fold into the CLI.
+        assert!(Config::parse("[options]\nscore_gate = -1").is_err());
+        assert!(Config::parse("[options]\nscore_gate = 6.5").is_err());
     }
 
     #[test]
