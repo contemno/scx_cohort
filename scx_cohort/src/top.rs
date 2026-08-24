@@ -56,7 +56,13 @@ fn render(s: &ProcsSnapshot) {
             id,
             "─ cohort ─",
             c.home_llc,
-            if c.pinned != 0 { "*" } else { " " },
+            if c.saturating != 0 {
+                "!"
+            } else if c.pinned != 0 {
+                "*"
+            } else {
+                " "
+            },
             c.tasks,
             c.util_pct,
             c.affinity_pct,

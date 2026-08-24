@@ -47,6 +47,25 @@ pub const COHORT_PINNED: u32 = 1;
 /// `preempt = false` rule.
 pub const COHORT_NO_PREEMPT: u32 = 2;
 
+/// `CohortPolicy::flags` bit: the cohort's aggregate duty exceeds
+/// `sat_duty_pct`% of its home CCD's capacity (set and cleared by the
+/// daemon, with confirm hysteresis). Members of a saturating cohort run a
+/// shortened slice (global slice / [`SAT_SLICE_DIV`], unless an explicit
+/// per-cohort `slice_us` rule applies) and become legal wakeup-preemption
+/// victims for wakeups from *other* cohorts. Intra-cohort preemption
+/// stays illegal — a saturating workload must not storm itself (the
+/// rev-1 middle-class lesson). Per-task signals cannot make this call: a
+/// compositor and a hackbench receiver look identical per-task (both
+/// wake often, run briefly, block voluntarily, score alike); what
+/// separates them is that one belongs to a cohort consuming an entire
+/// CCD. Work-conserving by construction: no CPU is ever held idle.
+pub const COHORT_SATURATING: u32 = 4;
+
+/// Slice divisor for saturating cohorts: their tasks run the global
+/// slice divided by this, bounding how long a latency-sensitive wakeup
+/// can queue behind them even where preemption does not apply.
+pub const SAT_SLICE_DIV: u64 = 2;
+
 /// Placement-statistics slots, aggregated per-CPU on the BPF side and
 /// summed by the daemon each tick.
 pub const STAT_SYNC_LOCAL: u32 = 0;
@@ -82,7 +101,12 @@ pub const STAT_SHADOW_ONLY_BINARY: u32 = 14;
 /// no running task qualifies as a victim.
 pub const STAT_PREEMPT_VNOTBATCH: u32 = 15;
 pub const STAT_PREEMPT_RATELIM: u32 = 16;
-pub const NR_STATS: u32 = 17;
+/// Preemptions enabled by [`COHORT_SATURATING`]: the victim was not
+/// batch (wakes frequently) but belonged to a saturating cohort and the
+/// wakee did not. Kept separate from `STAT_PREEMPT` so the knob's effect
+/// is directly visible.
+pub const STAT_PREEMPT_SAT: u32 = 17;
+pub const NR_STATS: u32 = 18;
 
 /// Wake-interval clamp for the periodicity EWMAs. Anything slower than
 /// ~1 s is "not periodic" for scheduling purposes; the clamp also keeps
@@ -186,7 +210,10 @@ pub struct TaskCtx {
     /// Shadow-mode: computed and exported everywhere, gating only when
     /// [`Tunables::score_gate`] is nonzero.
     pub latency_score: u16,
-    pub _pad_score: u16,
+    /// Nonzero when the task's cohort carries [`COHORT_SATURATING`];
+    /// cached alongside `no_preempt` so `running` can publish it without
+    /// a policy lookup.
+    pub saturating: u16,
 }
 
 /// Per-cohort placement policy. Created once by the BPF side when a

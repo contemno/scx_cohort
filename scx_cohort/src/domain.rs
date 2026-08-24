@@ -25,6 +25,9 @@ pub struct CohortSnapshot {
     pub id: u64,
     pub home_llc: u32,
     pub pinned: bool,
+    /// Carries `COHORT_SATURATING`: duty above the sat threshold of its
+    /// home CCD (set/cleared by the daemon's `SatTracker`).
+    pub saturating: bool,
     pub nr_tasks: u64,
     /// Weight-scaled runtime this tick (delta of the monotonic
     /// `CohortCtx::load_sum`).

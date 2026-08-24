@@ -107,6 +107,7 @@ scheduler with a restart code; the daemon re-initializes automatically
 | `--residency-ms` | 2000 | Post-move immunity: a cohort that moved stays put this long. |
 | `--merge-wakes-per-sec` | 300 | Sustained cross-cohort wake rate that merges two cohorts. |
 | `--score-gate` | 0 | **Experimental.** 0 keeps the per-task latency score in shadow mode: computed and exported (the `LAT` column, the `shadow:` monitor counters) but never gating. 1–100 makes `score >= gate` replace the binary interactive test for the vtime credit and wakee-side preemption; the victim-side batch predicate is unaffected. See DESIGN.md §4.6. |
+| `--sat-duty-pct` | 0 | **Experimental.** 0 = off. 1–100: a cohort whose per-tick duty exceeds this share of its home CCD's capacity is marked saturating (confirmed over 3 ticks, cleared with hysteresis): its tasks run half the global slice and become legal wakeup-preemption victims for *other* cohorts' wakeups, so latency-sensitive work is not held behind a CCD-filling batch cohort. Work-conserving — no CPU is left idle, unlike a footprint cap. See DESIGN.md §4.7. |
 | `--config <path>` | `/etc/scx_cohort.conf` | Config file. The default path may be absent; an explicit one must exist. |
 | `--no-rt` | off | Don't raise the daemon to SCHED_FIFO. |
 | `--stats <sec>` | — | Print aggregate metrics every interval while scheduling. |
