@@ -55,6 +55,8 @@ pub struct Metrics {
     pub nr_preempt_vnotbatch: u64,
     #[stat(desc = "preempt attempts denied: victim inside the rate limit")]
     pub nr_preempt_ratelim: u64,
+    #[stat(desc = "preemptions of a saturating cohort's member by another cohort's wakeup")]
+    pub nr_preempt_sat: u64,
     #[stat(desc = "wakeups clamped into a busy home CCD")]
     pub nr_home_miss_clamp: u64,
     #[stat(desc = "wakeups that skipped the idle ladder: home CCD had none")]
@@ -106,12 +108,13 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  place: sync={} prev={} core={} smt={} preempt={} vnotbatch={} ratelim={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
+            "  place: sync={} prev={} core={} smt={} preempt={} satpreempt={} vnotbatch={} ratelim={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
             self.nr_sync_local,
             self.nr_prev_idle,
             self.nr_idle_core,
             self.nr_idle_smt,
             self.nr_preempts,
+            self.nr_preempt_sat,
             self.nr_preempt_vnotbatch,
             self.nr_preempt_ratelim,
             self.nr_home_miss_clamp,
@@ -153,6 +156,7 @@ impl Metrics {
             nr_preempt_ratelim: self
                 .nr_preempt_ratelim
                 .saturating_sub(rhs.nr_preempt_ratelim),
+            nr_preempt_sat: self.nr_preempt_sat.saturating_sub(rhs.nr_preempt_sat),
             nr_home_miss_clamp: self
                 .nr_home_miss_clamp
                 .saturating_sub(rhs.nr_home_miss_clamp),
@@ -177,13 +181,23 @@ impl Metrics {
         // Affinity over THIS interval, not since attach — a cumulative
         // percentage would bury fresh regressions under old history.
         d.affinity_hit_pct = affinity_pct(
-            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt + d.nr_preempts,
+            d.nr_sync_local
+                + d.nr_prev_idle
+                + d.nr_idle_core
+                + d.nr_idle_smt
+                + d.nr_preempts
+                + d.nr_preempt_sat,
             d.nr_enq_home,
             d.nr_enq_spill,
             d.nr_steals,
         );
         d.plan_hit_pct = plan_hit_pct(
-            d.nr_sync_local + d.nr_prev_idle + d.nr_idle_core + d.nr_idle_smt + d.nr_preempts,
+            d.nr_sync_local
+                + d.nr_prev_idle
+                + d.nr_idle_core
+                + d.nr_idle_smt
+                + d.nr_preempts
+                + d.nr_preempt_sat,
             d.nr_enq_home,
             d.nr_enq_spill,
             d.nr_steals,
@@ -252,6 +266,8 @@ pub struct CohortRow {
     pub home_llc: u64,
     #[stat(desc = "pinned by a rule (1/0)")]
     pub pinned: u64,
+    #[stat(desc = "saturating its home CCD (1/0; see --sat-duty-pct)")]
+    pub saturating: u64,
     #[stat(desc = "live tasks")]
     pub tasks: u64,
     #[stat(desc = "CPU utilization, % of one CPU")]
@@ -318,6 +334,7 @@ pub fn procs_snapshot(
         let mut row = CohortRow {
             home_llc: c.home_llc as u64,
             pinned: c.pinned as u64,
+            saturating: c.saturating as u64,
             ..Default::default()
         };
         let mut cohort_duty = 0u64;
@@ -467,6 +484,7 @@ mod tests {
             id: 7,
             home_llc: 1,
             pinned: true,
+            saturating: true,
             nr_tasks: 3,
             load_ns: tick_ns,
             residency_ms: None,
@@ -522,6 +540,7 @@ mod tests {
         let c = &s.cohorts[&7];
         assert_eq!(c.home_llc, 1);
         assert_eq!(c.pinned, 1);
+        assert_eq!(c.saturating, 1);
         assert_eq!(c.tasks, 3);
         // Cohort: 1.25 CPUs of demand → 125%.
         assert!((c.util_pct - 125.0).abs() < 0.1);

@@ -339,6 +339,69 @@ pub fn plan_spills(
     desired
 }
 
+/// Tracks which cohorts are saturating their home LLC: per-tick duty
+/// above `pct`% of the home's capacity, confirmed for `confirm_ticks`
+/// consecutive ticks before the mark is set, and `confirm_ticks` below
+/// `pct − 10` (floored at 1) before it clears. The asymmetric clear
+/// threshold keeps a cohort oscillating around the boundary from
+/// flapping its slice and victim status every tick.
+#[derive(Debug)]
+pub struct SatTracker {
+    pct: u64,
+    confirm_ticks: u32,
+    state: HashMap<u64, SatState>,
+}
+
+#[derive(Debug, Default)]
+struct SatState {
+    streak: u32,
+    active: bool,
+}
+
+impl SatTracker {
+    pub fn new(pct: u64, confirm_ticks: u32) -> Self {
+        Self {
+            pct,
+            confirm_ticks,
+            state: HashMap::new(),
+        }
+    }
+
+    /// One tick of observation; returns the cohorts whose saturating
+    /// mark changed, as `(cohort_id, now_saturating)`. State for cohorts
+    /// absent from `cohorts` is dropped (they died; their policy entry is
+    /// being GC'd anyway).
+    pub fn update(&mut self, llcs: &[LlcLoad], cohorts: &[CohortSnapshot]) -> Vec<(u64, bool)> {
+        let capacity: HashMap<u32, u64> = llcs.iter().map(|l| (l.llc, l.capacity_ns)).collect();
+        let clear_pct = self.pct.saturating_sub(10).max(1);
+        let mut changes = Vec::new();
+
+        let live: HashSet<u64> = cohorts.iter().map(|c| c.id).collect();
+        self.state.retain(|id, _| live.contains(id));
+
+        for c in cohorts {
+            let Some(&cap) = capacity.get(&c.home_llc) else {
+                continue;
+            };
+            let s = self.state.entry(c.id).or_default();
+            let above = c.load_ns > cap * self.pct / 100;
+            let below = c.load_ns < cap * clear_pct / 100;
+
+            // The streak counts evidence *against* the current mark;
+            // anything else (including the hysteresis band between the
+            // two thresholds) resets it.
+            let flip_evidence = if s.active { below } else { above };
+            s.streak = if flip_evidence { s.streak + 1 } else { 0 };
+            if s.streak >= self.confirm_ticks {
+                s.active = !s.active;
+                s.streak = 0;
+                changes.push((c.id, s.active));
+            }
+        }
+        changes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +419,7 @@ mod tests {
             id,
             home_llc,
             pinned: false,
+            saturating: false,
             nr_tasks: 4,
             load_ns,
             residency_ms: None,
@@ -812,5 +876,73 @@ mod tests {
         // Below the low mark: everything comes home.
         let low = plan_spills(&cfg, &llcs, &cohorts_low, &tasks, &current);
         assert!(low.is_empty());
+    }
+
+    #[test]
+    fn sat_tracker_confirms_before_marking() {
+        let mut t = SatTracker::new(75, 3);
+        let llcs = [llc(0, 0, CAP)];
+        let hot = [cohort(1, 0, CAP * 80 / 100)];
+
+        // Two ticks above the threshold: not yet.
+        assert!(t.update(&llcs, &hot).is_empty());
+        assert!(t.update(&llcs, &hot).is_empty());
+        // Third consecutive tick confirms.
+        assert_eq!(t.update(&llcs, &hot), vec![(1, true)]);
+        // Staying above changes nothing further.
+        assert!(t.update(&llcs, &hot).is_empty());
+    }
+
+    #[test]
+    fn sat_tracker_hysteresis_band_holds_the_mark() {
+        let mut t = SatTracker::new(75, 3);
+        let llcs = [llc(0, 0, CAP)];
+        let hot = [cohort(1, 0, CAP * 80 / 100)];
+        // In the band between clear (65%) and set (75%): neither confirms.
+        let band = [cohort(1, 0, CAP * 70 / 100)];
+        let cold = [cohort(1, 0, CAP * 50 / 100)];
+
+        for _ in 0..3 {
+            t.update(&llcs, &hot);
+        }
+        // Band ticks must not clear an active mark...
+        for _ in 0..10 {
+            assert!(t.update(&llcs, &band).is_empty());
+        }
+        // ...and a band tick resets a clear streak in progress.
+        t.update(&llcs, &cold);
+        t.update(&llcs, &cold);
+        t.update(&llcs, &band);
+        assert!(t.update(&llcs, &cold).is_empty());
+        assert!(t.update(&llcs, &cold).is_empty());
+        assert_eq!(t.update(&llcs, &cold), vec![(1, false)]);
+    }
+
+    #[test]
+    fn sat_tracker_flapping_load_never_marks() {
+        let mut t = SatTracker::new(75, 3);
+        let llcs = [llc(0, 0, CAP)];
+        let hot = [cohort(1, 0, CAP * 80 / 100)];
+        let cold = [cohort(1, 0, CAP * 10 / 100)];
+
+        for _ in 0..10 {
+            assert!(t.update(&llcs, &hot).is_empty());
+            assert!(t.update(&llcs, &cold).is_empty());
+        }
+    }
+
+    #[test]
+    fn sat_tracker_drops_dead_cohorts() {
+        let mut t = SatTracker::new(75, 3);
+        let llcs = [llc(0, 0, CAP)];
+        let hot = [cohort(1, 0, CAP * 80 / 100)];
+
+        t.update(&llcs, &hot);
+        t.update(&llcs, &hot);
+        // The cohort vanishes for a tick; its streak must not survive.
+        t.update(&llcs, &[]);
+        assert!(t.update(&llcs, &hot).is_empty());
+        assert!(t.update(&llcs, &hot).is_empty());
+        assert_eq!(t.update(&llcs, &hot), vec![(1, true)]);
     }
 }

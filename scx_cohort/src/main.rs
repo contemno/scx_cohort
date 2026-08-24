@@ -68,11 +68,12 @@ use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use zerocopy::{FromBytes, IntoBytes};
 
-use balancer::{plan_spills, Balancer, BalancerCfg, SpillCfg};
+use balancer::{plan_spills, Balancer, BalancerCfg, SatTracker, SpillCfg};
 use domain::{CohortSnapshot, Decision, LlcLoad, TaskSnapshot};
 use scx_cohort_common::{
     CohortCounters, CohortPolicy, TaskStat, Tunables, WakeEdgeKey, COHORT_NO_PREEMPT,
-    COHORT_PINNED, DEFAULT_SLICE_NS, MAX_CPUS, MAX_LLCS, NR_STATS, SCORE_MIN_RUNS,
+    COHORT_PINNED, COHORT_SATURATING, DEFAULT_SLICE_NS, MAX_CPUS, MAX_LLCS, NR_STATS,
+    SCORE_MIN_RUNS,
 };
 use wake_graph::{WakeGraph, WakeGraphCfg};
 
@@ -148,6 +149,15 @@ struct Opts {
     /// is unaffected).
     #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=100))]
     score_gate: u32,
+
+    /// EXPERIMENTAL. 0 (default): off. 1-100: a cohort whose per-tick
+    /// duty exceeds this percentage of its home CCD's capacity is marked
+    /// saturating (with confirm hysteresis): its tasks run half the
+    /// global slice and become legal wakeup-preemption victims for other
+    /// cohorts' wakeups, so latency-sensitive work is not held behind a
+    /// CCD-filling batch cohort. Work-conserving: no CPU is left idle.
+    #[clap(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=100))]
+    sat_duty_pct: u64,
 
     /// Path to the TOML config file ([options] + [[rule]] tables; see
     /// README). The default path is optional: absent means defaults, but
@@ -247,6 +257,8 @@ struct Scheduler<'a> {
     interval: Duration,
     started_at: Instant,
     balancer: Balancer,
+    /// Saturating-cohort detection (`--sat-duty-pct`); `None` when off.
+    sat: Option<SatTracker>,
     /// LLC id → CPU count, for capacity computation.
     llc_cpus: BTreeMap<u32, u64>,
     /// cohort id → load_sum at the previous tick, for per-tick deltas.
@@ -386,6 +398,15 @@ impl<'a> Scheduler<'a> {
             .context("attaching the sched_process_exec severing hook")?;
         info!("scx_cohort attached");
 
+        if opts.sat_duty_pct > 0 {
+            warn!(
+                "--sat-duty-pct {} is EXPERIMENTAL: cohorts filling that \
+                 share of their home CCD run half the global slice and \
+                 become preemption victims for other cohorts' wakeups",
+                opts.sat_duty_pct
+            );
+        }
+
         Ok(Self {
             skel,
             _struct_ops: struct_ops,
@@ -398,6 +419,7 @@ impl<'a> Scheduler<'a> {
                 residency_ms: opts.residency_ms,
                 ..BalancerCfg::default()
             }),
+            sat: (opts.sat_duty_pct > 0).then(|| SatTracker::new(opts.sat_duty_pct, 3)),
             llc_cpus,
             prev_load_sum: HashMap::new(),
             prev_llc_load: HashMap::new(),
@@ -498,6 +520,7 @@ impl<'a> Scheduler<'a> {
                 id,
                 home_llc: policy.home_llc,
                 pinned: policy.flags & COHORT_PINNED != 0,
+                saturating: policy.flags & COHORT_SATURATING != 0,
                 nr_tasks,
                 load_ns: counters.load_sum.saturating_sub(prev),
                 residency_ms: self.residency_overrides.get(&id).copied(),
@@ -722,6 +745,40 @@ impl<'a> Scheduler<'a> {
                 want.flags |= COHORT_NO_PREEMPT;
             }
             if want.as_bytes() != policy.as_bytes() {
+                policy_map.update(&key, want.as_bytes(), MapFlags::EXIST)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Set/clear `COHORT_SATURATING` on cohorts the tracker flipped this
+    /// tick. Read-modify-write like `apply_rules`, touching only the one
+    /// flag so rule-owned fields (pins, per-cohort slices) survive.
+    fn apply_saturation(&mut self, llcs: &[LlcLoad], cohorts: &[CohortSnapshot]) -> Result<()> {
+        let Some(sat) = self.sat.as_mut() else {
+            return Ok(());
+        };
+        let policy_map = &self.skel.maps.cohort_policy;
+        for (cohort, active) in sat.update(llcs, cohorts) {
+            let key = cohort.to_ne_bytes();
+            let Some(val) = policy_map.lookup(&key, MapFlags::ANY)? else {
+                continue;
+            };
+            let Ok(policy) = CohortPolicy::read_from_bytes(val.as_slice()) else {
+                continue;
+            };
+            let mut want = policy;
+            if active {
+                want.flags |= COHORT_SATURATING;
+            } else {
+                want.flags &= !COHORT_SATURATING;
+            }
+            if want.as_bytes() != policy.as_bytes() {
+                debug!(
+                    "cohort {} {} saturating (duty vs home-CCD capacity)",
+                    cohort,
+                    if active { "marked" } else { "no longer" }
+                );
                 policy_map.update(&key, want.as_bytes(), MapFlags::EXIST)?;
             }
         }
@@ -957,7 +1014,8 @@ impl<'a> Scheduler<'a> {
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
                     + c[STAT_IDLE_SMT as usize]
-                    + c[STAT_PREEMPT as usize],
+                    + c[STAT_PREEMPT as usize]
+                    + c[STAT_PREEMPT_SAT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
@@ -967,7 +1025,8 @@ impl<'a> Scheduler<'a> {
                     + c[STAT_PREV_IDLE as usize]
                     + c[STAT_IDLE_CORE as usize]
                     + c[STAT_IDLE_SMT as usize]
-                    + c[STAT_PREEMPT as usize],
+                    + c[STAT_PREEMPT as usize]
+                    + c[STAT_PREEMPT_SAT as usize],
                 c[STAT_ENQ_HOME as usize],
                 c[STAT_ENQ_SPILL as usize],
                 c[STAT_STEAL as usize],
@@ -975,6 +1034,7 @@ impl<'a> Scheduler<'a> {
             nr_preempts: c[STAT_PREEMPT as usize],
             nr_preempt_vnotbatch: c[STAT_PREEMPT_VNOTBATCH as usize],
             nr_preempt_ratelim: c[STAT_PREEMPT_RATELIM as usize],
+            nr_preempt_sat: c[STAT_PREEMPT_SAT as usize],
             nr_sync_local: c[STAT_SYNC_LOCAL as usize],
             nr_prev_idle: c[STAT_PREV_IDLE as usize],
             nr_idle_core: c[STAT_IDLE_CORE as usize],
@@ -1018,6 +1078,7 @@ impl<'a> Scheduler<'a> {
         let llcs = self.llc_loads()?;
         let decisions = self.balancer.plan(self.now_ms(), &llcs, &cohorts);
         self.apply(decisions)?;
+        self.apply_saturation(&llcs, &cohorts)?;
         let desired = plan_spills(
             &self.spill_cfg,
             &llcs,
@@ -1174,10 +1235,14 @@ fn load_config(opts: &mut Opts, matches: &clap::ArgMatches) -> Result<config::Co
     apply!(residency_ms);
     apply!(merge_wakes_per_sec);
     apply!(score_gate);
+    apply!(sat_duty_pct);
     // The CLI parser bounds its own values; a config-sourced gate needs
     // the same check (101 must fail loudly, not schedule strangely).
     if opts.score_gate > 100 {
         bail!("score_gate must be 0..=100, got {}", opts.score_gate);
+    }
+    if opts.sat_duty_pct > 100 {
+        bail!("sat_duty_pct must be 0..=100, got {}", opts.sat_duty_pct);
     }
 
     Ok(cfg)

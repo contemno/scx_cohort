@@ -95,6 +95,14 @@ struct scratch_ctx {
 	 * elapsed.
 	 */
 	u32 curr_batch;
+	/*
+	 * The running task's cohort carries COHORT_SATURATING, and which
+	 * cohort that is. A saturating cohort's members are additionally
+	 * legal victims — but only for wakeups from OTHER cohorts, so a
+	 * saturating workload cannot preempt-storm itself.
+	 */
+	u32 curr_sat;
+	u64 curr_cohort;
 	/* Last time enqueue preempted this CPU; rate-limits the IPIs. */
 	u64 last_preempt_ts;
 };
@@ -301,6 +309,20 @@ static u64 resolve_cohort(struct task_struct *p, struct TaskCtx *tctx)
 }
 
 /*
+ * The effective slice a cohort's policy grants: an explicit per-cohort
+ * slice wins; otherwise a saturating cohort runs the global slice cut by
+ * SAT_SLICE_DIV, bounding how long anything queues behind its members.
+ */
+static u64 policy_slice(const struct CohortPolicy *policy)
+{
+	if (policy && policy->slice_ns)
+		return policy->slice_ns;
+	if (policy && (policy->flags & COHORT_SATURATING))
+		return slice_ns / SAT_SLICE_DIV;
+	return slice_ns;
+}
+
+/*
  * The LLC this task should be placed on: its cohort's home, or the spill
  * target if the daemon marked it spilled.
  */
@@ -324,9 +346,9 @@ static u32 task_home_llc(struct task_struct *p, struct TaskCtx *tctx)
 	 */
 	id = resolve_cohort(p, tctx);
 	policy = bpf_map_lookup_elem(&cohort_policy, &id);
-	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
-						      : slice_ns;
+	tctx->slice_ns = policy_slice(policy);
 	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
+	tctx->saturating = policy && (policy->flags & COHORT_SATURATING);
 
 	spill = bpf_map_lookup_elem(&spill_tasks, &pid);
 	if (spill) {
@@ -645,7 +667,21 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 									   &zero, prev);
 					u64 pnow = scx_bpf_now();
 
-					if (vs && !vs->curr_batch) {
+					/*
+					 * A member of a saturating cohort is
+					 * a legal victim even though it wakes
+					 * often — but only for wakeups from
+					 * OTHER cohorts, so the saturating
+					 * workload cannot storm itself.
+					 */
+					bool sat_victim =
+						vs && !vs->curr_batch &&
+						vs->curr_sat &&
+						vs->curr_cohort !=
+							tctx->cohort_id;
+
+					if (vs && !vs->curr_batch &&
+					    !sat_victim) {
 						/* The middle-class guard: prev
 						 * runs a frequently-waking task,
 						 * never a legal victim. Counted
@@ -660,7 +696,9 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 						/* Benign cross-CPU race: worst
 						 * case is one extra preempt. */
 						vs->last_preempt_ts = pnow;
-						stat_inc(STAT_PREEMPT);
+						stat_inc(sat_victim ?
+								 STAT_PREEMPT_SAT :
+								 STAT_PREEMPT);
 						scx_bpf_dsq_insert(p,
 							SCX_DSQ_LOCAL_ON | (u32)prev,
 							task_slice(tctx),
@@ -800,9 +838,12 @@ void BPF_STRUCT_OPS(cohort_running, struct task_struct *p)
 
 	/* Publish what this CPU runs, for remote preemption decisions. */
 	sctx = bpf_map_lookup_elem(&scratch_stor, &zero);
-	if (sctx)
+	if (sctx) {
 		sctx->curr_batch =
 			tctx->wake_freq < tunables.credit_wake_freq_min;
+		sctx->curr_sat = tctx->saturating;
+		sctx->curr_cohort = tctx->cohort_id;
+	}
 }
 
 void BPF_STRUCT_OPS(cohort_stopping, struct task_struct *p, bool runnable)
@@ -956,6 +997,7 @@ int BPF_PROG(cohort_exec_sever, struct task_struct *p, pid_t old_pid,
 	 */
 	tctx->slice_ns = slice_ns;
 	tctx->no_preempt = 0;
+	tctx->saturating = 0;
 	/*
 	 * A new program image invalidates the old one's behavioral
 	 * history; the latency score restarts from scratch like the
@@ -1031,9 +1073,9 @@ s32 BPF_STRUCT_OPS(cohort_init_task, struct task_struct *p,
 		tctx->vtime = llcx ? llcx->vtime_now : 0;
 	}
 	/* Seed the cached scheduling character; wakeups keep it fresh. */
-	tctx->slice_ns = (policy && policy->slice_ns) ? policy->slice_ns
-						      : slice_ns;
+	tctx->slice_ns = policy_slice(policy);
 	tctx->no_preempt = policy && (policy->flags & COHORT_NO_PREEMPT);
+	tctx->saturating = policy && (policy->flags & COHORT_SATURATING);
 
 	{
 		u32 pid = p->pid;

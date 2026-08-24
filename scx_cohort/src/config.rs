@@ -66,6 +66,11 @@ pub struct OptionsTable {
     /// score replaces the binary interactive test at this threshold).
     /// Bounds are enforced where `[options]` folds into the CLI opts.
     pub score_gate: Option<u32>,
+    /// EXPERIMENTAL: mark cohorts whose duty exceeds this % of their home
+    /// CCD as saturating (0 = off; shorter slice + preemptible by other
+    /// cohorts' wakeups). Bounds are enforced where `[options]` folds
+    /// into the CLI opts.
+    pub sat_duty_pct: Option<u64>,
     /// SCHED_FIFO priority for the daemon; 0 disables the RT boost.
     pub rt_priority: Option<i32>,
     /// Drop ALL capabilities once the scheduler is attached. The daemon
@@ -314,6 +319,9 @@ preempt = false
         let cfg = Config::parse("[options]\nscore_gate = 60").unwrap();
         assert_eq!(cfg.options.score_gate, Some(60));
         assert!(Config::parse("").unwrap().options.score_gate.is_none());
+        let cfg = Config::parse("[options]\nsat_duty_pct = 75").unwrap();
+        assert_eq!(cfg.options.sat_duty_pct, Some(75));
+        assert!(Config::parse("").unwrap().options.sat_duty_pct.is_none());
         // Negative or non-integer values are type errors at parse time;
         // the 0..=100 range is enforced when options fold into the CLI.
         assert!(Config::parse("[options]\nscore_gate = -1").is_err());
