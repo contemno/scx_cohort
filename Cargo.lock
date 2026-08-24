@@ -938,9 +938,9 @@ dependencies = [
 
 [[package]]
 name = "scx_cargo"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5caa224bcd8cfa163518386d4364595a149e84329fdffdb5bb2aa0bb5996ef"
+checksum = "1befd874ce76a94bc696b587ca52c123be345c930a1c9f8ea2d52dd3375fe2b5"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adf877d18ba02bb926a2ac6a9696d44c404547ee7150db441c8cb61f23dffc99"
+checksum = "56631808bc2cba14c8f0be00e0aea8e70c27f3ed6b4630e892ab62c6cfd85e37"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1007,9 +1007,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats_derive"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d243381b7adbe5ea4cb10e2a8c9cdef12a90b35904d3e434d265546e395bdc6f"
+checksum = "5708dfb29b0be460e0fb9aa704c67193fad64398bceeab00083c11450b0c39ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1020,9 +1020,9 @@ dependencies = [
 
 [[package]]
 name = "scx_utils"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "157af3b8ef95cfc1467ad8850df7b7072445bd702ae6f6357af17576a42e8f42"
+checksum = "53eb9590123e91af1593c138aa45428dd13fb525b045cc80d7ea601fbf67b0fa"
 dependencies = [
  "anyhow",
  "bindgen",
