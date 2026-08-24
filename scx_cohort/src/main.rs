@@ -973,6 +973,8 @@ impl<'a> Scheduler<'a> {
                 c[STAT_STEAL as usize],
             ),
             nr_preempts: c[STAT_PREEMPT as usize],
+            nr_preempt_vnotbatch: c[STAT_PREEMPT_VNOTBATCH as usize],
+            nr_preempt_ratelim: c[STAT_PREEMPT_RATELIM as usize],
             nr_sync_local: c[STAT_SYNC_LOCAL as usize],
             nr_prev_idle: c[STAT_PREV_IDLE as usize],
             nr_idle_core: c[STAT_IDLE_CORE as usize],
