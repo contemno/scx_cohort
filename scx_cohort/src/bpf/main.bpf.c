@@ -645,9 +645,18 @@ void BPF_STRUCT_OPS(cohort_enqueue, struct task_struct *p, u64 enq_flags)
 									   &zero, prev);
 					u64 pnow = scx_bpf_now();
 
-					if (vs && vs->curr_batch &&
-					    pnow - vs->last_preempt_ts >
-						    tunables.preempt_min_ns) {
+					if (vs && !vs->curr_batch) {
+						/* The middle-class guard: prev
+						 * runs a frequently-waking task,
+						 * never a legal victim. Counted
+						 * so victim starvation under
+						 * saturating loads is visible. */
+						stat_inc(STAT_PREEMPT_VNOTBATCH);
+					} else if (vs &&
+						   pnow - vs->last_preempt_ts <=
+							   tunables.preempt_min_ns) {
+						stat_inc(STAT_PREEMPT_RATELIM);
+					} else if (vs) {
 						/* Benign cross-CPU race: worst
 						 * case is one extra preempt. */
 						vs->last_preempt_ts = pnow;

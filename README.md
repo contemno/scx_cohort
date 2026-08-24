@@ -81,6 +81,12 @@ column is the per-task latency score (0–100; the maximum over threads
 whose score has enough samples to mean anything) — the shadow-mode
 classifier of DESIGN.md §4.6, whose agreement with the binary
 interactive test appears as the `shadow:` line in `--monitor` output.
+The `place:` line splits wakeup-preemption outcomes three ways:
+`preempt=` (fired), `vnotbatch=` (denied — the wakee's previous CPU ran a
+frequently-waking task, never a legal victim) and `ratelim=` (denied —
+legal victim inside the per-victim rate limit). Under a saturating
+fork-heavy load, `vnotbatch` dwarfing `preempt` means interactive wakeups
+are queueing behind full slices because nothing qualifies as a victim.
 
 The daemon raises itself to `SCHED_FIFO 10` so it can never be starved by
 the scheduling class it implements (`--no-rt` or `rt_priority = 0` in the

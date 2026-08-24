@@ -51,6 +51,10 @@ pub struct Metrics {
     pub nr_idle_smt: u64,
     #[stat(desc = "interactive wakeups preempting a batch task on prev_cpu")]
     pub nr_preempts: u64,
+    #[stat(desc = "preempt attempts denied: prev_cpu ran a non-batch task")]
+    pub nr_preempt_vnotbatch: u64,
+    #[stat(desc = "preempt attempts denied: victim inside the rate limit")]
+    pub nr_preempt_ratelim: u64,
     #[stat(desc = "wakeups clamped into a busy home CCD")]
     pub nr_home_miss_clamp: u64,
     #[stat(desc = "wakeups that skipped the idle ladder: home CCD had none")]
@@ -102,12 +106,14 @@ impl Metrics {
         )?;
         writeln!(
             w,
-            "  place: sync={} prev={} core={} smt={} preempt={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
+            "  place: sync={} prev={} core={} smt={} preempt={} vnotbatch={} ratelim={} clamp={} skip={} enq={} | spill={} steal={} tctx_err={}",
             self.nr_sync_local,
             self.nr_prev_idle,
             self.nr_idle_core,
             self.nr_idle_smt,
             self.nr_preempts,
+            self.nr_preempt_vnotbatch,
+            self.nr_preempt_ratelim,
             self.nr_home_miss_clamp,
             self.nr_idle_skips,
             self.nr_enq_home,
@@ -141,6 +147,12 @@ impl Metrics {
             nr_idle_core: self.nr_idle_core.saturating_sub(rhs.nr_idle_core),
             nr_idle_smt: self.nr_idle_smt.saturating_sub(rhs.nr_idle_smt),
             nr_preempts: self.nr_preempts.saturating_sub(rhs.nr_preempts),
+            nr_preempt_vnotbatch: self
+                .nr_preempt_vnotbatch
+                .saturating_sub(rhs.nr_preempt_vnotbatch),
+            nr_preempt_ratelim: self
+                .nr_preempt_ratelim
+                .saturating_sub(rhs.nr_preempt_ratelim),
             nr_home_miss_clamp: self
                 .nr_home_miss_clamp
                 .saturating_sub(rhs.nr_home_miss_clamp),

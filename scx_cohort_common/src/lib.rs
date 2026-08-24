@@ -71,7 +71,18 @@ pub const STAT_IDLE_SKIP: u32 = 11;
 pub const STAT_SHADOW_BOTH: u32 = 12;
 pub const STAT_SHADOW_ONLY_SCORE: u32 = 13;
 pub const STAT_SHADOW_ONLY_BINARY: u32 = 14;
-pub const NR_STATS: u32 = 15;
+/// Failure modes of the wakeup-preemption attempt, split so the two can
+/// be told apart on hardware. An interactive wakeup that reaches the
+/// victim check either preempts (`STAT_PREEMPT`), finds the previous CPU
+/// running a task that wakes too often to be a legal victim
+/// (`STAT_PREEMPT_VNOTBATCH` — the middle-class guard), or finds a legal
+/// victim inside the per-victim rate limit (`STAT_PREEMPT_RATELIM`).
+/// Under a saturating fork-heavy load, VNOTBATCH dwarfing PREEMPT is the
+/// signature of interactive wakeups queueing behind full slices because
+/// no running task qualifies as a victim.
+pub const STAT_PREEMPT_VNOTBATCH: u32 = 15;
+pub const STAT_PREEMPT_RATELIM: u32 = 16;
+pub const NR_STATS: u32 = 17;
 
 /// Wake-interval clamp for the periodicity EWMAs. Anything slower than
 /// ~1 s is "not periodic" for scheduling purposes; the clamp also keeps
