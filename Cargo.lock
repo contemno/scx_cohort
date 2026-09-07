@@ -600,9 +600,9 @@ dependencies = [
 
 [[package]]
 name = "libbpf-rs"
-version = "0.27.0"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e69ad90c37d14f657291712f297a1460a1d1b647da45e0e372996b807c38f02"
+checksum = "e31aef1b2b743b2ebcc8eded144207c0f05c2d59e2d8c1d40dfa65f59437b60f"
 dependencies = [
  "bitflags",
  "libbpf-sys",
@@ -645,9 +645,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.33"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memchr"
@@ -938,9 +938,9 @@ dependencies = [
 
 [[package]]
 name = "scx_cargo"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5caa224bcd8cfa163518386d4364595a149e84329fdffdb5bb2aa0bb5996ef"
+checksum = "1befd874ce76a94bc696b587ca52c123be345c930a1c9f8ea2d52dd3375fe2b5"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -967,7 +967,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "globset",
- "libbpf-rs 0.27.0",
+ "libbpf-rs 0.27.1",
  "libc",
  "log",
  "scx_cargo",
@@ -977,7 +977,7 @@ dependencies = [
  "scx_utils",
  "serde",
  "simplelog",
- "toml 1.1.4+spec-1.1.0",
+ "toml 1.1.5+spec-1.1.0",
  "zerocopy",
 ]
 
@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adf877d18ba02bb926a2ac6a9696d44c404547ee7150db441c8cb61f23dffc99"
+checksum = "56631808bc2cba14c8f0be00e0aea8e70c27f3ed6b4630e892ab62c6cfd85e37"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1007,9 +1007,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats_derive"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d243381b7adbe5ea4cb10e2a8c9cdef12a90b35904d3e434d265546e395bdc6f"
+checksum = "5708dfb29b0be460e0fb9aa704c67193fad64398bceeab00083c11450b0c39ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1020,9 +1020,9 @@ dependencies = [
 
 [[package]]
 name = "scx_utils"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "157af3b8ef95cfc1467ad8850df7b7072445bd702ae6f6357af17576a42e8f42"
+checksum = "53eb9590123e91af1593c138aa45428dd13fb525b045cc80d7ea601fbf67b0fa"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -1339,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
 dependencies = [
  "indexmap",
  "serde_core",
