@@ -307,9 +307,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "crossbeam"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
+checksum = "e71406cd8807725f7ac2f999a4cdd32e98f829fdf65f528343cebf945e41df1e"
 dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
@@ -600,9 +600,9 @@ dependencies = [
 
 [[package]]
 name = "libbpf-rs"
-version = "0.27.0"
+version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e69ad90c37d14f657291712f297a1460a1d1b647da45e0e372996b807c38f02"
+checksum = "e31aef1b2b743b2ebcc8eded144207c0f05c2d59e2d8c1d40dfa65f59437b60f"
 dependencies = [
  "bitflags",
  "libbpf-sys",
@@ -645,9 +645,9 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "log"
-version = "0.4.33"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memchr"
@@ -938,9 +938,9 @@ dependencies = [
 
 [[package]]
 name = "scx_cargo"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5caa224bcd8cfa163518386d4364595a149e84329fdffdb5bb2aa0bb5996ef"
+checksum = "1befd874ce76a94bc696b587ca52c123be345c930a1c9f8ea2d52dd3375fe2b5"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -967,7 +967,7 @@ dependencies = [
  "clap",
  "crossbeam",
  "globset",
- "libbpf-rs 0.27.0",
+ "libbpf-rs 0.27.1",
  "libc",
  "log",
  "scx_cargo",
@@ -977,7 +977,7 @@ dependencies = [
  "scx_utils",
  "serde",
  "simplelog",
- "toml 1.1.4+spec-1.1.0",
+ "toml 1.1.6+spec-1.1.0",
  "zerocopy",
 ]
 
@@ -990,9 +990,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adf877d18ba02bb926a2ac6a9696d44c404547ee7150db441c8cb61f23dffc99"
+checksum = "56631808bc2cba14c8f0be00e0aea8e70c27f3ed6b4630e892ab62c6cfd85e37"
 dependencies = [
  "anyhow",
  "crossbeam",
@@ -1007,9 +1007,9 @@ dependencies = [
 
 [[package]]
 name = "scx_stats_derive"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d243381b7adbe5ea4cb10e2a8c9cdef12a90b35904d3e434d265546e395bdc6f"
+checksum = "5708dfb29b0be460e0fb9aa704c67193fad64398bceeab00083c11450b0c39ec"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1020,9 +1020,9 @@ dependencies = [
 
 [[package]]
 name = "scx_utils"
-version = "1.1.2"
+version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "157af3b8ef95cfc1467ad8850df7b7072445bd702ae6f6357af17576a42e8f42"
+checksum = "53eb9590123e91af1593c138aa45428dd13fb525b045cc80d7ea601fbf67b0fa"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -1339,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -1666,18 +1666,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "556764e583adb45a9f8d413c2a147fa7e8d821e48e12b14fd560b607998b75eb"
+checksum = "d35102a9f36d089ccae9e4c6802bc118be4487b80aaffc0ab4e0cf5ce92d2873"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.56"
+version = "0.8.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2ab42fc20575779bd240faa45f94a74256f755c0fa9e89f0ede20d91d0cdfc1"
+checksum = "146c01f5ab44258da43cf276c74a2763db2ff3969c9c652c3f2de07041d0b2bc"
 dependencies = [
  "proc-macro2",
  "quote",
